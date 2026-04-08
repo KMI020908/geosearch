@@ -15,7 +15,6 @@ geo_translator = ChatOpenAI(
     base_url="https://api.deepseek.com",
     model="deepseek-chat",
     api_key=_DEEPSEEK_API_KEY,
-    request_timeout=30,
     temperature=0,
     top_p=0.9,
     max_tokens=20,
