@@ -15,7 +15,7 @@ async def main() -> None:
     print(f"{df.height} unique city records loaded.")
 
     print("Step 2/3  Filling missing multilingual names...")
-    df = await fill_missing_names(df)
+    df = await fill_missing_names(df, max_concurrent=128)
 
     out_path = PROCESSED_DIR / "cities.parquet"
     print(f"Step 3/3  Saving -> {out_path}")
