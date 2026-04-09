@@ -1,17 +1,37 @@
 """Core preprocessing pipeline: fill missing multilingual city names via LLM."""
 import asyncio
+import json
+from pathlib import Path
 
 import polars as pl
+from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
-from ..config import CYRILLIC_LANGUAGES, LANGUAGES, TRANSLATED_LANGUAGES
+from ..config import CYRILLIC_LANGUAGES, LANGUAGES, PROCESSED_DIR, TRANSLATED_LANGUAGES
 from .translation import build_messages, geo_translator, latin_to_cyrillic
+
+_DEFAULT_CACHE_PATH = PROCESSED_DIR / "translations_cache.json"
+
+
+def _load_cache(path: Path) -> dict[str, dict[str, str]]:
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_cache(cache: dict[str, dict[str, str]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(cache, f, ensure_ascii=False)
 
 
 async def fill_missing_names(
     df: pl.DataFrame,
     max_concurrent: int = 512,
+    warm_start: bool = False,
+    cache_path: Path | None = None,
 ) -> pl.DataFrame:
     """
     Ensure every city has at least one name in every target language.
@@ -89,9 +109,18 @@ async def fill_missing_names(
         structured["info"].append(lang_data)
 
     # ── Pass 2: batch LLM translation ─────────────────────────────────────────
+    cache_path = cache_path or _DEFAULT_CACHE_PATH
+
+    # Cache stores {lang: {str(geoname_id): translated_name}}.
+    cache: dict[str, dict[str, str]] = _load_cache(cache_path) if warm_start else {}
+    if warm_start and cache:
+        total = sum(len(v) for v in cache.values())
+        print(f"warm_start: loaded {total} cached translations from {cache_path}")
+
     translated: dict[str, dict[int, str]] = {}
     sem = asyncio.Semaphore(max_concurrent)
 
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
     async def _translate(msg: list) -> str:
         async with sem:
             return await geo_translator.ainvoke(msg)
@@ -99,16 +128,27 @@ async def fill_missing_names(
     for lang, entries in to_translate.items():
         if not entries:
             continue
-        messages = [build_messages(name, lang) for name in entries.values()]
-        responses = await atqdm.gather(
-            *[_translate(m) for m in messages],
-            desc=f"Translating [{lang}]",
-        )
-        translated_names = [
-            latin_to_cyrillic(r.content) if lang in CYRILLIC_LANGUAGES else r.content
-            for r in responses
-        ]
-        translated[lang] = dict(zip(entries.keys(), translated_names))
+
+        lang_cache = cache.setdefault(lang, {})
+
+        # Skip entries already translated in a previous run.
+        pending = {gid: name for gid, name in entries.items() if str(gid) not in lang_cache}
+        cached_count = len(entries) - len(pending)
+        if cached_count:
+            print(f"warm_start: skipping {cached_count} already-translated [{lang}] entries")
+
+        if pending:
+            messages = [build_messages(name, lang) for name in pending.values()]
+            responses = await atqdm.gather(
+                *[_translate(m) for m in messages],
+                desc=f"Translating [{lang}]",
+            )
+            for gid, r in zip(pending.keys(), responses):
+                name = latin_to_cyrillic(r.content) if lang in CYRILLIC_LANGUAGES else r.content
+                lang_cache[str(gid)] = name
+            _save_cache(cache, cache_path)
+
+        translated[lang] = {gid: lang_cache[str(gid)] for gid in entries}
 
     # ── Pass 3: apply translations / fallbacks and normalise info structure ────
     result: dict[str, list] = {"geoname_id": [], "info": []}

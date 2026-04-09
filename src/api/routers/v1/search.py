@@ -11,13 +11,13 @@ router = APIRouter(prefix="/search", tags=["search"])
 @router.get("", response_model=SearchResponse)
 def search(
     request: Request,
-    q: Annotated[str, Query(min_length=1, description="Search query")],
+    query: Annotated[str, Query(min_length=0, description="Search query")],
     top_k: Annotated[int, Query(ge=1, le=100, description="Max results")] = 20,
 ) -> SearchResponse:
     index = request.app.state.index
-    hits = index.search(q, top_k=top_k)
+    hits = index.search(query, top_k=top_k)
     return SearchResponse(
-        query=q,
+        query=query,
         results=[CityResult(**h) for h in hits],
         total=len(hits),
     )
