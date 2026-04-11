@@ -64,25 +64,31 @@ class GeoSearchIndex:
     def search(self, query: str, top_k: int = 20) -> list[dict]:
         """Return up to top_k cities matching *query*, sorted by population."""
         tokens = _char_ngrams(query)
+        raw_scores = self._bm25.get_scores(tokens)
+        name_scores: dict[str, float] = dict(zip(self._corpus, raw_scores))
         top_names: list[str] = self._bm25.get_top_n(tokens, self._corpus, n=top_k)
 
-        # Expand names → (population, geoname_id) candidates
+        # Expand names → (population, geoname_id) candidates; track best BM25 score per city
         candidates: list[tuple[int, int]] = []
+        gid_score: dict[int, float] = {}
         for name in top_names:
+            score = name_scores[name]
             for gid, pop in zip(
                 self._name_to_gids[name], self._name_to_populations[name]
             ):
                 candidates.append((pop, gid))
+                if gid not in gid_score or score > gid_score[gid]:
+                    gid_score[gid] = score
 
-        # Deduplicate and sort by population descending
-        candidates.sort(key=lambda x: -x[0])
+        # Deduplicate and sort by score desc, then population desc
+        candidates.sort(key=lambda x: (-gid_score.get(x[1], 0.0), -x[0]))
         seen: set[int] = set()
         results: list[dict] = []
         for _, gid in candidates:
             if gid not in seen:
                 seen.add(gid)
                 if gid in self._cities:
-                    results.append(self._cities[gid])
+                    results.append({**self._cities[gid], "score": gid_score.get(gid, 0.0)})
             if len(results) >= top_k:
                 break
 

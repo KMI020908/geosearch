@@ -10,6 +10,7 @@ class CityResult(BaseModel):
     latitude:    float
     longitude:   float
     population:  int
+    score:       float
 
 
 class SearchResponse(BaseModel):

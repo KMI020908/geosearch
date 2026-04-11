@@ -15,18 +15,23 @@ geosearch/
 │   │   ├── alternateNamesV2.txt
 │   │   └── admin1CodesASCII.txt
 │   └── processed/
-│       ├── cities.parquet           # Результат preprocessing
+│       ├── cities.parquet           # Результат preprocessing городов
+│       ├── regions.parquet          # Результат preprocessing регионов
 │       └── bm25_index.pkl           # Сериализованный BM25 индекс
 │
 ├── src/
 │   ├── data/
 │   │   ├── config.py                # Глобальные константы и пути
+│   │   ├── translation.py           # LLM-перевод через DeepSeek
 │   │   ├── build_index.py           # CLI: сборка и сохранение BM25 индекса
-│   │   └── preprocess_cities/
-│   │       ├── loader.py            # Загрузка и структурирование сырых данных
-│   │       ├── translation.py       # LLM-перевод через DeepSeek
-│   │       ├── pipeline.py          # Заполнение пропущенных переводов
-│   │       └── run.py               # CLI: запуск preprocessing
+│   │   ├── preprocess_cities/
+│   │   │   ├── loader.py            # Загрузка и структурирование сырых данных
+│   │   │   ├── pipeline.py          # Заполнение пропущенных переводов
+│   │   │   └── run.py               # CLI: запуск preprocessing городов
+│   │   └── preprocess_regions/
+│   │       ├── utils.py             # scan_admin1_codes, per-country процессоры и таблицы диспетчеризации
+│   │       ├── pipeline.py          # Сбор кандидатов, LLM-перевод, диспетчеризация по странам
+│   │       └── run.py               # CLI: запуск preprocessing регионов
 │   │
 │   ├── models/
 │   │   └── bm25_index.py            # GeoSearchIndex — from_parquet / load / save / search
@@ -47,7 +52,7 @@ geosearch/
 
 ## Что реализовано
 
-### Preprocessing (`src/data/preprocess_cities/`)
+### Preprocessing городов (`src/data/preprocess_cities/`)
 
 Преобразует сырые файлы GeoNames в структурированный Parquet-датасет.
 
@@ -60,6 +65,25 @@ geosearch/
    - кириллические языки (`ru`, `uk`, …) — перевод через LLM (DeepSeek);
    - остальные — фолбэк на английское имя.
 5. **Сохранение** — `data/processed/cities.parquet`.
+
+### Preprocessing регионов (`src/data/preprocess_regions/`)
+
+Переводит названия административных регионов первого уровня (admin1) из `admin1CodesASCII.txt` на все целевые языки.
+
+**Стратегия перевода** изолирована по странам в `utils.py`:
+
+| Страна | `en` | `ru` | `tr` |
+|--------|------|------|------|
+| RU | `ascii_name` | LLM | LLM |
+| TR | `ascii_name` | LLM | колонка `name` (нативное) |
+| US | `ascii_name` | LLM | `ascii_name` |
+| fallback | `ascii_name` | `ascii_name` | `ascii_name` |
+
+`pipeline.py` не содержит логики конкретных стран — он опирается на два словаря из `utils.py`: `PROCESSORS` (как строить строки) и `TRANSLATE_LANGS` (какие языки отправлять в LLM).
+
+**Поддержка новых стран:** страны без записи в `PROCESSORS` автоматически попадают в `process_fallback`. Для полной поддержки достаточно написать функцию `process_XX` и добавить её в оба словаря в `utils.py`.
+
+**Сохранение** — `data/processed/regions.parquet` (схема: `admin1_code`, `country_code`, `language`, `name`).
 
 ### Поисковый индекс (`src/models/bm25_index.py`)
 
@@ -136,10 +160,11 @@ make run        # запуск сервера
 ### Пошагово
 
 ```bash
-make install    # установить зависимости (uv sync)
-make preprocess # собрать cities.parquet из сырых данных GeoNames
-make build-index # собрать bm25_index.pkl
-make run        # запустить сервер на :8000
+make install           # установить зависимости (uv sync)
+make preprocess        # собрать cities.parquet из сырых данных GeoNames
+make preprocess-regions # собрать regions.parquet из admin1CodesASCII.txt
+make build-index       # собрать bm25_index.pkl
+make run               # запустить сервер на :8000
 ```
 
 Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)

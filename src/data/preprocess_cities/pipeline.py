@@ -9,7 +9,7 @@ from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
 from ..config import CYRILLIC_LANGUAGES, LANGUAGES, PROCESSED_DIR, TRANSLATED_LANGUAGES
-from .translation import build_messages, geo_translator, latin_to_cyrillic
+from ..translation import build_messages, geo_translator, latin_to_cyrillic
 
 _DEFAULT_CACHE_PATH = PROCESSED_DIR / "translations_cache.json"
 
