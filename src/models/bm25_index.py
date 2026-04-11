@@ -145,3 +145,184 @@ class GeoSearchIndex:
             d["name"]: d["population"]
             for d in grouped.select("name", "population").to_dicts()
         }
+
+
+
+# """BM25-based geo-search index backed by GeoNames Parquet files."""
+# import pickle
+# from pathlib import Path
+
+# import numpy as np
+# import polars as pl
+# from country_list import countries_for_language
+# from rank_bm25 import BM25Okapi
+
+
+# def _country_names_for_languages(languages: list[str]) -> dict[str, dict[str, str]]:
+#     """Return {lang: {country_code: name}}."""
+#     result: dict[str, dict[str, str]] = {}
+#     for lang in languages:
+#         result[lang] = dict(countries_for_language(lang))
+#     return result
+
+
+# def _char_ngrams(text: str, n: int = 3) -> list[str]:
+#     text = text.lower().strip()
+#     return [text[i : i + n] for i in range(len(text) - n + 1)]
+
+
+# class _BM25Uniform(BM25Okapi):
+#     """BM25Okapi with uniform IDF = 1.0 for every term.
+
+#     Standard BM25 penalises high-frequency terms — a city name like "Moscow"
+#     that appears in many documents gets a near-zero IDF and is effectively
+#     invisible to the scorer.  Setting all IDF values to 1.0 means scores
+#     reflect only term frequency and document-length normalisation, which is
+#     the correct behaviour for city-name retrieval.
+#     """
+
+#     def _calc_idf(self, nd: dict[str, int]) -> None:
+#         for word in nd:
+#             self.idf[word] = 1.0
+#         self.average_idf = 1.0
+
+
+# class GeoSearchIndex:
+#     """
+#     In-memory BM25 index over exploded multilingual city name documents.
+
+#     Document structure
+#     ------------------
+#     Each city is exploded so that every individual name variant becomes its
+#     own BM25 document.  Each document contains only same-language context:
+
+#         {name}  {country_name_in_same_language}  {region_name_in_same_language}
+
+#     For example, the Russian name "Москва" is paired with "Россия" and
+#     "Москва" (oblast), while the English name "Moscow" is paired with
+#     "Russia" and "Moscow Oblast".
+
+#     Documents are tokenised into character 3-grams (same as the original
+#     implementation), which provides fuzzy matching across transliterations
+#     and minor spelling variations.
+
+#     Retrieval
+#     ---------
+#     1. Tokenise the query into character 3-grams.
+#     2. Score all name documents with :class:`_BM25Uniform` (uniform IDF).
+#     3. Collect the best score per geoname_id across all its name documents.
+#     4. Return the top-k cities sorted by score descending.
+
+#     Persistence
+#     -----------
+#     Build with :meth:`from_parquet`, then :meth:`save`.  Reload with
+#     :meth:`load` — much faster than rebuilding from scratch.
+#     """
+
+#     _LANGUAGES = ["en", "tr", "ru"]
+
+#     # ── constructors ─────────────────────────────────────────────────────────
+
+#     @classmethod
+#     def from_parquet(
+#         cls,
+#         cities_path: Path,
+#         regions_path: Path,
+#         k1: float = 1.5,
+#         b: float = 0.75,
+#     ) -> "GeoSearchIndex":
+#         """Build the index from pre-processed cities and regions Parquet files."""
+#         instance = cls.__new__(cls)
+#         instance._build(cities_path, regions_path, k1=k1, b=b)
+#         return instance
+
+#     @classmethod
+#     def load(cls, index_path: Path) -> "GeoSearchIndex":
+#         """Load a previously saved index from disk."""
+#         with open(index_path, "rb") as f:
+#             return pickle.load(f)
+
+#     # ── persistence ──────────────────────────────────────────────────────────
+
+#     def save(self, index_path: Path) -> None:
+#         """Serialise the index to disk."""
+#         index_path.parent.mkdir(parents=True, exist_ok=True)
+#         with open(index_path, "wb") as f:
+#             pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+#     # ── public interface ──────────────────────────────────────────────────────
+
+#     def search(self, query: str, top_k: int = 20) -> list[dict]:
+#         """Return up to *top_k* city dicts ranked by BM25 score."""
+#         tokens = _char_ngrams(query)
+#         if not tokens:
+#             return []
+
+#         scores: np.ndarray = self._bm25.get_scores(tokens)
+
+#         # Best score per geoname_id across all its name documents
+#         gid_score: dict[int, float] = {}
+#         for doc_idx, score in enumerate(scores):
+#             if score <= 0:
+#                 continue
+#             gid = self._doc_gids[doc_idx]
+#             if score > gid_score.get(gid, 0.0):
+#                 gid_score[gid] = score
+
+#         sorted_gids = sorted(gid_score, key=gid_score.__getitem__, reverse=True)[:top_k]
+#         return [
+#             {**self._cities[gid], "score": float(gid_score[gid])}
+#             for gid in sorted_gids
+#         ]
+
+#     # ── internal ──────────────────────────────────────────────────────────────
+
+#     def _build(
+#         self, cities_path: Path, regions_path: Path, k1: float, b: float
+#     ) -> None:
+#         cities = pl.read_parquet(cities_path)
+
+#         # (country_code, admin1_code, language) → region name
+#         region_lookup: dict[tuple[str, str, str], str] = {}
+#         for row in pl.read_parquet(regions_path).iter_rows(named=True):
+#             key = (row["country_code"], row["admin1_code"], row["language"])
+#             region_lookup[key] = row["name"]
+
+#         # {lang: {country_code: name}}
+#         country_lookup = _country_names_for_languages(self._LANGUAGES)
+
+#         self._cities: dict[int, dict] = {}
+#         self._doc_gids: list[int] = []
+#         corpus: list[list[str]] = []
+
+#         for row in cities.iter_rows(named=True):
+#             gid = row["geoname_id"]
+#             country_code = row["country_code"]
+#             admin1_code = row["admin1_code"]
+
+#             self._cities[gid] = {
+#                 "geoname_id":   gid,
+#                 "ascii_name":   row["ascii_name"],
+#                 "country_code": country_code,
+#                 "admin1_code":  admin1_code,
+#                 "latitude":     row["latitude"],
+#                 "longitude":    row["longitude"],
+#                 "population":   row["population"],
+#             }
+
+#             seen_names: set[str] = set()
+#             for lang_entry in row["info"]:
+#                 lang = lang_entry["language"]
+#                 country_name = country_lookup.get(lang, {}).get(country_code, "")
+#                 region_name = region_lookup.get((country_code, admin1_code, lang), "")
+
+#                 for name in lang_entry["names"]:
+#                     if name in seen_names:
+#                         continue
+#                     seen_names.add(name)
+
+#                     doc = " ".join(filter(None, [name, country_name, region_name]))
+#                     corpus.append(_char_ngrams(doc))
+#                     self._doc_gids.append(gid)
+
+#         self._bm25 = _BM25Uniform(corpus, k1=k1, b=b)

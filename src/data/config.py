@@ -12,6 +12,7 @@ PROCESSED_DIR = ROOT_DIR / "data" / "processed"
 COUNTRIES: list[str] = ["RU", "US", "TR"]
 LANGUAGES: list[str] = ["ru", "en", "tr"]
 INDEX_PATH = PROCESSED_DIR / "bm25_index.pkl"
+GLINER_MODEL = str(ROOT_DIR / "models" / "gliner_multi-v2.1")
 
 # ── Language groups ───────────────────────────────────────────────────────────
 # Languages that use the Cyrillic script.
