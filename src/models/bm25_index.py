@@ -1,14 +1,21 @@
 """BM25-based geo-search index backed by a GeoNames Parquet file."""
+import logging
 import pickle
 from pathlib import Path
 
 import polars as pl
 from rank_bm25 import BM25Okapi
 
+logger = logging.getLogger(__name__)
+
 
 def _char_ngrams(text: str, n: int = 3) -> list[str]:
     text = text.lower().strip()
-    return [text[i:i+n] for i in range(len(text) - n + 1)]
+    words = text.split()
+    ngrams = []
+    for word in words:
+        ngrams.extend([word[i:i+n] for i in range(len(word) - n + 1)])
+    return ngrams
 
 
 class GeoSearchIndex:
@@ -61,9 +68,18 @@ class GeoSearchIndex:
 
     # ── public interface ──────────────────────────────────────────────────────
 
-    def search(self, query: str, top_k: int = 20) -> list[dict]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 20,
+        context_id: str | None = None,
+    ) -> list[dict]:
         """Return up to top_k cities matching *query*, sorted by population."""
         tokens = _char_ngrams(query)
+        logger.info(
+            "BM25 tokenized query",
+            extra={"context_id": context_id, "stage": "bm25", "tokens": tokens},
+        )
         raw_scores = self._bm25.get_scores(tokens)
         name_scores: dict[str, float] = dict(zip(self._corpus, raw_scores))
         top_names: list[str] = self._bm25.get_top_n(tokens, self._corpus, n=top_k)
