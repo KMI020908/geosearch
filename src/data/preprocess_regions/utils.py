@@ -108,7 +108,14 @@ def process_fallback(
     out = []
     for row in df.iter_rows(named=True):
         for lang in languages:
-            out.append({"admin1_code": row["admin1_code"], "country_code": row["country_code"], "language": lang, "name": row["ascii_name"]})
+            out.append(
+                {
+                    "admin1_code": row["admin1_code"],
+                    "country_code": row["country_code"],
+                    "language": lang,
+                    "name": row["ascii_name"]
+                }
+            )
     return out
 
 
@@ -125,7 +132,7 @@ PROCESSORS: dict[str, callable] = {
 # Maps country_code -> languages that need LLM translation for that country.
 # Pipeline uses this to collect translation candidates without any country-specific logic.
 TRANSLATE_LANGS: dict[str, callable] = {
-    "RU": lambda langs: [l for l in langs if l != "en"],
-    "TR": lambda langs: [l for l in langs if l not in ("en", "tr")],
-    "US": lambda langs: [l for l in langs if l not in ("en", "tr")],
+    "RU": lambda langs: [lang for lang in langs if lang != "en"],
+    "TR": lambda langs: [lang for lang in langs if lang not in ("en", "tr")],
+    "US": lambda langs: [lang for lang in langs if lang not in ("en", "tr")],
 }

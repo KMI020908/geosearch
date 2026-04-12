@@ -1,7 +1,7 @@
 # GeoSearch
 
-Сервис полнотекстового гео-поиска по текстовому запросу на русском, английском и турецком языках.  
-Поиск реализован на BM25 (character n-grams) поверх данных [GeoNames](https://www.geonames.org/), API — FastAPI.
+Сервис гео-поиска по текстовому запросу на русском, английском и турецком языках.  
+Запрос может быть произвольным текстом — GLiNER извлекает из него топонимы, которые затем ищутся в BM25-индексе по данным [GeoNames](https://www.geonames.org/). API — FastAPI.
 
 ---
 
@@ -19,6 +19,9 @@ geosearch/
 │       ├── regions.parquet          # Результат preprocessing регионов
 │       └── bm25_index.pkl           # Сериализованный BM25 индекс
 │
+├── models/
+│   └── gliner_multi-v2.1/           # Локальные веса GLiNER (multilingual)
+│
 ├── src/
 │   ├── data/
 │   │   ├── config.py                # Глобальные константы и пути
@@ -34,6 +37,7 @@ geosearch/
 │   │       └── run.py               # CLI: запуск preprocessing регионов
 │   │
 │   ├── models/
+│   │   ├── city_detector.py         # CityDetector — NER → нормализация → BM25
 │   │   └── bm25_index.py            # GeoSearchIndex — from_parquet / load / save / search
 │   │
 │   └── api/
@@ -51,6 +55,29 @@ geosearch/
 ---
 
 ## Что реализовано
+
+### Pipeline обнаружения городов (`src/models/city_detector.py`)
+
+`CityDetector` — основная точка входа. Обрабатывает произвольный текст в три стадии:
+
+**Stage 1 — NER (GLiNER)**  
+Модель `gliner_multi-v2.1` извлекает из запроса именованные сущности типов `CITY`, `COUNTRY`, `STATE`, `REGION` вместе с confidence-оценками. Если сущности не найдены — возвращается пустой список.
+
+**Stage 2 — Нормализация**  
+Извлечённые спаны дедуплицируются по символьным позициям `(start, end)`: при перекрытии оставляется спан с максимальным score. Оставшиеся спаны сортируются слева направо, приводятся к нижнему регистру и объединяются в строку-запрос для BM25.
+
+**Stage 3 — BM25 поиск**  
+Нормализованная строка ищется в `GeoSearchIndex`. Результаты возвращаются ранжированными по BM25-score.
+
+### Поисковый индекс (`src/models/bm25_index.py`)
+
+`GeoSearchIndex` строит BM25 индекс над всеми альтернативными именами городов:
+
+- Токенизация: **character 3-grams** — устойчива к опечаткам и разным языкам.
+- Каждый документ в корпусе — одно уникальное имя города.
+- Скоринг: **uniform BM25** (IDF = 1 для всех термов) — чистый TF-based матчинг n-грам без штрафа за частоту терма в корпусе.
+- После BM25-скоринга результаты **переранжируются по BM25 score, затем по населению**, дубликаты удаляются.
+- Индекс строится один раз (`build_index.py`) и сохраняется в `bm25_index.pkl` — при старте загружается из pickle.
 
 ### Preprocessing городов (`src/data/preprocess_cities/`)
 
@@ -85,20 +112,12 @@ geosearch/
 
 **Сохранение** — `data/processed/regions.parquet` (схема: `admin1_code`, `country_code`, `language`, `name`).
 
-### Поисковый индекс (`src/models/bm25_index.py`)
-
-`GeoSearchIndex` строит BM25 индекс над всеми альтернативными именами городов:
-
-- Токенизация: **character 3-grams** — устойчива к опечаткам и разным языкам.
-- Каждый документ в корпусе — одно уникальное имя города.
-- После BM25-скоринга результаты **переранжируются по численности населения**, дубликаты удаляются.
-- Индекс строится один раз (`build_index.py`) и сохраняется в `bm25_index.pkl` — приложение загружает его из pickle, не пересобирая при каждом старте.
-
 ### REST API (`src/api/`)
 
 | Метод | Путь | Описание |
 | --- | --- | --- |
 | `GET` | `/v1/search` | Поиск городов по тексту |
+| `GET` | `/health` | Liveness check |
 | `GET` | `/docs` | Swagger UI |
 | `GET` | `/redoc` | ReDoc |
 
@@ -106,14 +125,14 @@ geosearch/
 
 | Параметр | Тип | По умолчанию | Описание |
 | --- | --- | --- | --- |
-| `q` | `string` | обязательный | Поисковый запрос |
+| `q` | `string` | обязательный | Поисковый запрос (произвольный текст) |
 | `top_k` | `int` | `20` | Количество результатов (1–100) |
 
 **Пример ответа:**
 
 ```json
 {
-  "query": "Москва",
+  "query": "Хочу переехать в Москву",
   "total": 1,
   "results": [
     {
@@ -146,6 +165,8 @@ cd geosearch
 DEEPSEEK_API_KEY=your_api_key_here
 ```
 
+Веса GLiNER (`gliner_multi-v2.1`) должны лежать в `models/gliner_multi-v2.1/` — скачиваются один раз с HuggingFace или передаются вручную.
+
 ---
 
 ## Запуск локально
@@ -160,11 +181,11 @@ make run        # запуск сервера
 ### Пошагово
 
 ```bash
-make install           # установить зависимости (uv sync)
-make preprocess        # собрать cities.parquet из сырых данных GeoNames
+make install            # установить зависимости (uv sync)
+make preprocess         # собрать cities.parquet из сырых данных GeoNames
 make preprocess-regions # собрать regions.parquet из admin1CodesASCII.txt
-make build-index       # собрать bm25_index.pkl
-make run               # запустить сервер на :8000
+make build-index        # собрать bm25_index.pkl
+make run                # запустить сервер на :8000
 ```
 
 Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
@@ -173,7 +194,7 @@ Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ## Запуск в Docker
 
-Данные подготавливаются на хосте и монтируются в контейнер как volume — образ содержит только код и зависимости.
+Данные и модель подготавливаются на хосте и монтируются в контейнер как volume — образ содержит только код и зависимости.
 
 ```bash
 # 1. Подготовить данные (один раз, на хосте)
@@ -191,7 +212,10 @@ make docker-run
 
 ```bash
 docker build -t geosearch .
-docker run --rm -p 8000:8000 -v $(PWD)/data/processed:/app/data/processed geosearch
+docker run --rm -p 8000:8000 \
+  -v $(PWD)/data/processed:/app/data/processed \
+  -v $(PWD)/models:/app/models \
+  geosearch
 ```
 
 ---
@@ -199,12 +223,12 @@ docker run --rm -p 8000:8000 -v $(PWD)/data/processed:/app/data/processed geosea
 ## Примеры запросов
 
 ```bash
-# По-русски
-curl "http://localhost:8000/v1/search?q=Москва&top_k=5"
+# Произвольный текст на русском
+curl "http://localhost:8000/v1/search?q=Хочу+переехать+в+Москву&top_k=5"
 
 # По-английски
-curl "http://localhost:8000/v1/search?q=New+York&top_k=10"
+curl "http://localhost:8000/v1/search?q=flights+to+New+York&top_k=10"
 
 # По-турецки
-curl "http://localhost:8000/v1/search?q=Istanbul"
+curl "http://localhost:8000/v1/search?q=Istanbul+gezisi"
 ```
