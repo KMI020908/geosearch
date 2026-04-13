@@ -8,3 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Env
+.env
+
+# Models
+/models/
+
+# Logs
+logs/
