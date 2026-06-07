@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache
 
 # Virtual environments
 .venv
@@ -12,5 +13,9 @@ wheels/
 # Env
 .env
 
-# Logs
-logs/
+# Development
+.vscode
+.claude
+
+# Raw Data
+data/raw/
