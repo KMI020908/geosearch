@@ -16,6 +16,3 @@ wheels/
 # Development
 .vscode
 .claude
-
-# Raw Data
-data/raw/
