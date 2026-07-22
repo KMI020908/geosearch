@@ -8,7 +8,7 @@ from sqlalchemy import (
     String,
     Text,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
@@ -34,10 +34,6 @@ class Geoname(Base):
     timezone: Mapped[str | None] = mapped_column(String(40))
     modification_date: Mapped[Date | None] = mapped_column(Date)
 
-    alternate_names: Mapped[list["AlternateName"]] = relationship(
-        back_populates="geoname", cascade="all, delete-orphan"
-    )
-
 
 class AlternateName(Base):
     """An alternate name variant for a GeoNames place."""
@@ -58,5 +54,3 @@ class AlternateName(Base):
     is_historic: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # 'geonames' for original data, 'generated' for our enrichments
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="geonames")
-
-    geoname: Mapped["Geoname"] = relationship(back_populates="alternate_names")

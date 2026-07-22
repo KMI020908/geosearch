@@ -1,6 +1,11 @@
+from typing import TypeVar
+
+import numpy as np
 from rank_bm25 import BM25Okapi
 
 from src.search.tokenizer import char_ngrams
+
+T = TypeVar("T")
 
 
 class _BM25Uniform(BM25Okapi):
@@ -24,16 +29,17 @@ class BM25Index:
         tokenized = [char_ngrams(doc) for doc in documents]
         self._bm25 = _BM25Uniform(tokenized)
 
-    def get_top_n(self, query: str, ids: list[list[int]], n: int) -> list[int]:
-        """Return geonameids of the top-*n* matching names, flattened.
+    def get_top_n(self, query: str, payloads: list[T], n: int) -> list[tuple[T, float]]:
+        """Return the top-*n* ``(payload, bm25_score)`` pairs, best first.
 
-        Each document is one name that may carry several geonameids (homonyms,
-        asciiname == alternate name).  BM25 ranks names; the id-lists of the top
-        *n* names are flattened into a single id list — the notebook's
-        ``sum(res, [])``.  So *n* names yield *at least* *n* ids.
+        *payloads* is parallel to the documents the index was built from: one
+        entry per name.  The score is computed per query — unlike population,
+        it isn't a property of the corpus alone — so it's handed back here
+        instead of being cached on the payload.
         """
-        groups = self._bm25.get_top_n(char_ngrams(query), ids, n=n)
-        return [gid for group in groups for gid in group]
+        scores = self._bm25.get_scores(char_ngrams(query))
+        top_n = np.argsort(scores)[::-1][:n]
+        return [(payloads[i], float(scores[i])) for i in top_n]
 
 
 if __name__ == "__main__":
@@ -41,7 +47,8 @@ if __name__ == "__main__":
     docs = ["Moscow", "Moscow Oblast", "Saint Petersburg"]
     ids = [[1, 10], [2], [3]]
     index = BM25Index(docs)
-    top = index.get_top_n("Moskva", ids=ids, n=2)
-    assert 1 in top, top  # "Moscow" group should surface, flattened to ints
-    assert all(isinstance(x, int) for x in top), top
+    top = index.get_top_n("Moskva", payloads=ids, n=2)
+    top_payloads = [payload for payload, _ in top]
+    assert [1, 10] in top_payloads, top  # "Moscow" group should surface, ids kept grouped
+    assert len(top) == 2, top
     print("ok", top)

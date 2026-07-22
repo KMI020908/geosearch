@@ -24,14 +24,17 @@ services:
     environment:
       # Override host from localhost (.env) to the Docker service name
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      # Write the BM25 index onto the persisted volume below, not the ephemeral
-      # container FS — otherwise the index is rebuilt on every container start.
-      INDEX_PATH: /data/bm25_index.pkl
+      # Load the persisted BM25 index on start (it lives in ./data, bind-mounted
+      # below). Delete data/bm25_index.pkl after a corpus change to rebuild it.
+      INDEX_WARM_START: "true"
     volumes:
       # Persist the downloaded GLiNER model weights across restarts
       - hf_cache:/root/.cache/huggingface
-      # Persist the BM25 index so it survives restarts
-      - app_data:/data
+      # Bind-mount the host data dir at the WORKDIR-relative path config expects
+      # (/app/data). This is the single source of truth: the reranker model,
+      # BM25 index, and datasets the Makefile writes on the host are all visible
+      # to the container, and vice versa.
+      - ./data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -40,4 +43,3 @@ services:
 volumes:
   postgres_data:
   hf_cache:
-  app_data:

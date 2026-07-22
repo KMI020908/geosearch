@@ -14,13 +14,19 @@ async def search(
     session: DBSession,
     text: str = Query(..., min_length=1, description="Free-text query"),
     top_k: int = Query(default=50, ge=1, le=100, description="Number of results"),
+    use_rerank: bool = Query(
+        default=True, description="Reorder with the trained reranker (if loaded)"
+    ),
 ) -> SearchResponse:
     """Search for populated places matching the geographic entities in *text*.
 
     The text is run through GLiNER to extract city/region/country spans,
-    then the BM25 index retrieves the best matching GeoNames entries.
+    then the BM25 index retrieves the best matching GeoNames entries, which
+    are reordered by the trained reranker (or population sort as a fallback).
     """
-    entities, matches = await engine.search(text, top_k=top_k, session=session)
+    entities, matches = await engine.search(
+        text, top_k=top_k, session=session, use_rerank=use_rerank
+    )
     return SearchResponse(
         query=text,
         entities=entities,
@@ -33,8 +39,10 @@ async def search(
                 feature_code=m.feature_code,
                 latitude=m.latitude,
                 longitude=m.longitude,
+                score=score,
+                retriever_score=m.retriever_score,
             )
-            for m in matches
+            for m, score in matches
         ],
         total=len(matches),
     )

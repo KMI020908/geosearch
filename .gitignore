@@ -6,6 +6,7 @@ dist/
 wheels/
 *.egg-info
 .pytest_cache
+.ruff_cache
 
 # Virtual environments
 .venv
@@ -16,3 +17,6 @@ wheels/
 # Development
 .vscode
 .claude
+ 
+# Models
+catboost_info/
