@@ -65,37 +65,47 @@ make dataset                     # -> data/query_dataset.parquet + data/query_pl
 ### Reranker
 
 `src/rerank/` turns the synthetic query dataset into a trained CatBoost ranker
-that reorders BM25's candidates. It's a two-stage pipeline:
+that reorders BM25's candidates. It's a two-stage pipeline, gated by a golden-set
+comparison:
 
 1. **`dataset.py`** (`make rerank-data`) replays every query in
    `data/query_dataset.parquet` through the *live* search API with
    `use_rerank=false`, so the training data never depends on the reranker it's
-   about to train. For each query, the gold geonameid(s) become positive
-   examples; the top retrieved non-gold candidates become hard negatives
-   (`RERANK__NEG_POOL=hard_capped`, the default — capped at
-   `RERANK__N_NEG_PER_POS` per positive; `full_pool` takes every retrieved
-   non-gold candidate instead, matching serve-time exactly, but currently
-   underperforms `hard_capped` on this dataset's size — see the config
-   docstring in `src/config.py`). Both query and document are raw text: the
-   document is `build_descriptions()` — sorted name spellings + country +
-   admin1 region, the same text the retriever indexes, so online and offline
-   features stay identical. The result is split **by geonameid** (not by
-   query row) into `data/rerank_train.parquet` / `data/rerank_test.parquet`,
-   so a place never leaks across the split.
-2. **`train.py`** (`make rerank-train`) fits a CatBoost `YetiRank` listwise
-   ranker directly on the raw `(query, document)` text — CatBoost does its own
-   tokenization, no manual embedding step — grouped per query, with early
-   stopping on NDCG@`RERANK__NDCG_TOP` over the held-out geonameids. The
-   trained model is saved to `data/rerank_model.cbm`.
+   about to train. For each query the gold geonameid(s) are labelled positive and
+   every other retrieved candidate negative. Each candidate is featurised by the
+   shared `src/rerank/features.py::build_row` — the *same* builder the online
+   reranker uses, so train- and serve-time features are identical by construction.
+   The features are the NER `entities` and the candidate `document` text (both
+   handed to CatBoost as text features) plus `log_population` (the dominant
+   tiebreak signal, log-scaled), `retriever_score`, and `retriever_rank`. The
+   `entities` — not the raw query — are used because that is exactly what the
+   engine feeds the reranker online; the `document` is `build_descriptions()`
+   (sorted name spellings + country + admin1 region). To change the feature set,
+   edit `src/rerank/features.py`. The result is split **by query** — the ranking
+   group — into `data/rerank_train.parquet` / `data/rerank_test.parquet`, so a
+   query (and its gold) never leaks across the split. Splitting by geonameid
+   instead would tear a query's candidates across both sets, leaking the query and
+   leaving truncated (or positive-less) test groups.
+2. **`train.py`** (`make rerank-train`) fits a CatBoost `YetiRank` listwise ranker
+   over those features, grouped per query, with early stopping on
+   NDCG@`RERANK__NDCG_TOP` over the held-out queries. The trained model is saved
+   to `data/rerank_model.cbm`.
 
 `src/rerank/model.py::Reranker` is the inference-side wrapper `SearchEngine`
-loads at startup; it scores candidates against the same `build_descriptions`
-text used at training time.
+loads at startup; it featurises candidates with the same `build_row`.
 
 ```bash
-uv run uvicorn src.api.main:app --reload &   # rerank-data needs the API up
+uv run uvicorn src.api.main:app --reload &   # rerank-data / rerank-eval need the API up
 make rerank                                   # rerank-data -> rerank-train
+make rerank-eval                              # golden-set: rerank vs baseline vs ideal
 ```
+
+**Golden-set gate.** `evaluate.py` (`make rerank-eval`) replays the curated
+`data/golden_set.parquet` through the API with the reranker off and on, and also
+computes the *ideal* (oracle) reordering, printing `RR / P@1 / R@k` for all three.
+The reranker only earns its place if it clears the retriever baseline — since it
+merely reorders the retrieved top-k, `R@50` never changes; the win shows up in the
+top-heavy `P@1` / `RR`. If it's below baseline, keep `use_rerank=false`.
 
 ---
 
@@ -214,6 +224,7 @@ reranker training feature.
 |--------|-------------|
 | `make rerank-data` | Mine labelled `(query, document, label)` pairs by replaying the query dataset through the live search API (needs `uvicorn`/Docker `app` up) |
 | `make rerank-train` | Fit the CatBoost `YetiRank` reranker on the mined pairs → `data/rerank_model.cbm` |
+| `make rerank-eval` | Golden-set metrics: rerank vs retriever baseline vs ideal ceiling (needs the API up) |
 | `make rerank` | Full pipeline: `rerank-data` → `rerank-train` |
 
 ### Development
@@ -255,8 +266,10 @@ geosearch/
     │   ├── sampling.py         # Polars sample plan: names, homonyms, stratified pick
     │   └── generate.py         # DeepSeek generation: concurrency + warm-start checkpoint
     ├── rerank/
-    │   ├── dataset.py          # mine (query, document, label) pairs from the live API
+    │   ├── features.py         # shared feature builder (train/serve parity)
+    │   ├── dataset.py          # mine labelled feature rows from the live API
     │   ├── train.py            # fit the CatBoost YetiRank ranker, NDCG@k eval
+    │   ├── evaluate.py         # golden-set: rerank vs baseline vs ideal
     │   └── model.py            # Reranker: inference-side scoring wrapper
     └── api/
         ├── main.py             # FastAPI app + lifespan (builds engine once)
@@ -296,9 +309,8 @@ All settings live in `src/config.py` and are overridable via `.env`:
 | `DATASET__OUTPUT_PATH` | `data/query_dataset.parquet` | Where the generated dataset is written |
 | `DATASET__PLAN_PATH` | `data/query_plan.parquet` | Where the sample plan is written |
 | `RERANK__SEARCH_URL` | `http://localhost:8000/v1/search` | Live search API `rerank-data` replays queries against |
-| `RERANK__NEG_POOL` | `hard_capped` | `hard_capped` (top `N_NEG_PER_POS` hardest negatives) or `full_pool` (every non-gold retrieved candidate, matching serve-time depth — currently underperforms on this dataset's size) |
-| `RERANK__N_NEG_PER_POS` | `3` | Negatives per positive when `NEG_POOL=hard_capped` |
-| `RERANK__TEST_SIZE` | `0.2` | Fraction of distinct geonameids held out for test (split by geonameid, never by row) |
+| `RERANK__TEST_SIZE` | `0.2` | Fraction of distinct queries held out for test (split by query — the ranking group — never by geonameid) |
+| `RERANK__GOLDEN_SET_PATH` | `data/golden_set.parquet` | Curated `(query, gold geonameIds)` set for `make rerank-eval` (never used for training) |
 | `RERANK__MODEL_PATH` | `data/rerank_model.cbm` | Where the trained reranker is saved/loaded from |
 | `RERANK__NDCG_TOP` | `10` | `k` for the NDCG@k early-stopping/eval metric |
 

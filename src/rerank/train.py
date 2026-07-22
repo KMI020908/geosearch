@@ -1,10 +1,11 @@
 """Train a CatBoost reranker on the labelled pairs from :mod:`src.rerank.dataset`.
 
-The model is a listwise ranker (``YetiRank`` loss) over raw ``query`` and
-``document`` text, grouped per query so ranking is learned within each query's
-candidate set. Both texts are handed to CatBoost as ``text_features`` — it does
-its own tokenisation, so no manual embedding step. Evaluation is NDCG@k on the
-held-out geonameids.
+The model is a listwise ranker (``YetiRank`` loss) over the shared feature set
+from :mod:`src.rerank.features` — the ``entities``/``document`` text (handed to
+CatBoost as ``text_features``, tokenised internally) plus numeric features
+(log-population, retriever score, retriever rank). Rows are grouped per query so
+ranking is learned within each query's candidate set. Evaluation is NDCG@k on
+the held-out queries.
 
 Run as::
 
@@ -20,28 +21,25 @@ import polars as pl
 from catboost import CatBoost, Pool
 
 from src.config import RerankConfig, settings
+from src.rerank.features import FEATURE_COLUMNS, TEXT_FEATURES
 
 logger = logging.getLogger(__name__)
-
-_TEXT_FEATURES = ["query", "document"]
-_NUM_FEATURES = ["population", "retriever_score"]
-_FEATURES = _TEXT_FEATURES + _NUM_FEATURES
 
 
 def to_pool(df: pd.DataFrame) -> Pool:
     """Wrap a train/test frame as a CatBoost ranking Pool.
 
     ``group_id`` is the query (factorised to ints): CatBoost ranks documents
-    within each group, so all rows of one query must share a group. ``query``
-    and ``document`` are text features (CatBoost tokenises them itself);
-    ``population`` and ``retriever_score`` are plain numeric features.
+    within each group, so all rows of one query must share a group — the mined
+    rows are already contiguous per query, so factorising is safe. Features and
+    which of them are text come from :mod:`src.rerank.features`.
     """
     group_id = df["query"].factorize()[0]
     return Pool(
-        data=df[_FEATURES],
+        data=df[FEATURE_COLUMNS],
         label=df["label"],
         group_id=group_id,
-        text_features=_TEXT_FEATURES,
+        text_features=TEXT_FEATURES,
     )
 
 
@@ -84,7 +82,9 @@ def main() -> None:
     # ranking setup), so read the eval history and index it at best_iteration.
     best_it = model.get_best_iteration()
     evals = model.get_evals_result().get("validation", {})
-    scores = {m: seq[best_it] for m, seq in evals.items()} if best_it is not None else {}
+    scores = (
+        {m: seq[best_it] for m, seq in evals.items()} if best_it is not None else {}
+    )
     logger.info("Test scores @ best iter %s: %s", best_it, scores)
 
 

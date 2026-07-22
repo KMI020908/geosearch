@@ -1,4 +1,4 @@
-.PHONY: up down migrate migrate-gen migrate-up download load etl update dataset rerank-data rerank-train rerank test lint typecheck clean help
+.PHONY: up down migrate migrate-gen migrate-up download load etl update dataset rerank-data rerank-train rerank-eval rerank test lint typecheck clean help
 
 PYTHON := .venv/bin/python
 
@@ -26,6 +26,7 @@ help:
 	@echo "  Reranker"
 	@echo "    rerank-data  Build labelled reranker pairs (needs the search API up)"
 	@echo "    rerank-train Train the CatBoost reranker on the pairs"
+	@echo "    rerank-eval  Golden-set rerank-vs-baseline-vs-ideal metrics (needs the API up)"
 	@echo "    rerank       Full reranker pipeline: rerank-data -> rerank-train"
 	@echo ""
 	@echo "  Development"
@@ -90,6 +91,9 @@ rerank-data:
 
 rerank-train:
 	$(PYTHON) -m src.rerank.train
+
+rerank-eval:
+	$(PYTHON) -m src.rerank.evaluate
 
 rerank: rerank-data rerank-train
 

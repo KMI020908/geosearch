@@ -77,15 +77,21 @@ whether `settings.rerank.model_path` exists; if not, search falls back to plain
 retriever-order + population-tiebreak (`use_rerank` flag on `/v1/search` and on
 `SearchEngine.search`). `src/rerank/dataset.py` builds training pairs by replaying the
 synthetic query dataset through the *live* search API with `use_rerank=False` (so
-training data never depends on the reranker being trained), using the query's gold
-`geonameid`(s) as positives and top non-gold retrieved candidates as hard negatives.
-`src/rerank/train.py` fits a CatBoost `YetiRank` listwise ranker directly on raw
-`(query, document)` text (CatBoost's own `text_features` tokenization — no manual
-embedding step), grouped per query, evaluated by NDCG@k on held-out geonameids
-(split by geonameid, not by row, so a place never leaks train↔test).
-`src/rerank/model.py::Reranker` is the inference-side wrapper the engine loads; it
-scores against the same `build_descriptions` document text used at training time
-(names + country + admin1 region) to keep online/offline features identical.
+training data never depends on the reranker being trained), labelling the query's gold
+`geonameid`(s) positive and every other retrieved candidate negative. Every candidate is
+featurised by the shared `src/rerank/features.py::build_row` — the same builder the online
+`Reranker` uses, so train/serve features are identical by construction: the NER `entities`
+and candidate `document` text (CatBoost `text_features`) plus `log_population`,
+`retriever_score`, `retriever_rank`. The text feature is the `entities` (what the engine
+actually feeds the reranker), not the raw query. To change the feature set, edit
+`src/rerank/features.py`. `src/rerank/train.py` fits a CatBoost `YetiRank` listwise ranker
+over those features, grouped per query, evaluated by NDCG@k on held-out queries
+(split by query — the ranking group — so a query and its gold never leak
+train↔test; splitting by geonameid would tear a query's candidates across both
+sets, leaking the query and leaving positive-less test groups). `make rerank-eval`
+(`src/rerank/evaluate.py`) is the golden-set gate: rerank vs retriever baseline vs the
+ideal (oracle) ceiling. `src/rerank/model.py::Reranker` is the inference-side wrapper the
+engine loads; the `document` is `build_descriptions` text (names + country + admin1).
 
 **Synthetic query dataset** (`src/dataset/`) feeds both the reranker and retrieval
 evaluation notebooks — not reranker-specific. `sampling.py` does population-stratified

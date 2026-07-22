@@ -84,11 +84,14 @@ class RerankConfig(BaseModel):
     top_k: int = 50
     request_timeout: float = 30.0
 
-    # Fraction of distinct geonameids held out for test (split by geonameid so
-    # a place never appears in both train and test).
+    # Fraction of distinct queries held out for test (split by query — the
+    # ranking group — so no query text leaks across train and test).
     test_size: float = 0.2
 
     query_dataset_path: str = "data/query_dataset.parquet"
+    # Hand-curated (query, gold geonameIds) set for the final rerank-vs-baseline
+    # comparison (make rerank-eval). Never used for training or model selection.
+    golden_set_path: str = "data/golden_set.parquet"
     train_path: str = "data/rerank_train.parquet"
     test_path: str = "data/rerank_test.parquet"
     model_path: str = "data/rerank_model.cbm"
@@ -130,9 +133,7 @@ class Settings(BaseSettings):
     # Retrieval BM25 index
     index_path: str = Field(default="data/bm25_index.pkl")
     index_warm_start: bool = Field(default=False)
-    excluded_feature_codes: list[str] = Field(
-        default=["PPLH", "PPLQ", "PPLW", "PPLX"]
-    )
+    excluded_feature_codes: list[str] = Field(default=["PPLH", "PPLQ", "PPLW", "PPLX"])
 
     # Synthetic query-dataset generation (secret from env, tunables nested).
     deepseek_api_key: str | None = Field(default=None)

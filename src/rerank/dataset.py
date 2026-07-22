@@ -8,11 +8,11 @@ The pipeline mirrors the notebook prototype, cleaned up:
    sees exactly the documents retrieval indexes.
 2. Replay every generated query through the live search API
    (:func:`search_batch`) to mine retrieval candidates.
-3. For each query, emit its gold geonameid(s) as positives, the top retrieved
-   non-gold candidates as hard negatives, and a few uniformly random
-   documents from the whole corpus as easy negatives (:func:`build_pairs`).
-4. Split by geonameid so a place never leaks across train/test
-   (:func:`split`) and write both Parquets.
+3. Featurise every retrieved candidate (:func:`build_pairs` via
+   :mod:`src.rerank.features`), labelling gold geonameid(s) positive and every
+   other retrieved candidate negative.
+4. Split by query — the ranking group — so no query (and its gold) leaks
+   across train/test (:func:`split`) and write both Parquets.
 
 The API server must be running (``RERANK__SEARCH_URL``). Run as::
 
@@ -32,11 +32,14 @@ from tqdm import tqdm
 from src.config import RerankConfig, settings
 from src.dataset.sampling import load_admin1_names, load_name_rows
 from src.db.session import AsyncSessionFactory
+from src.rerank.features import FEATURE_COLUMNS, build_row
 
 logger = logging.getLogger(__name__)
 
-PAIR_SCHEMA = ["query", "document", "geonameid", "population", "retriever_score", "label"]
-OUTPUT_COLS = ["query", "document", "population", "retriever_score", "label"]
+# One mined row: the shared feature columns, the raw ``query`` (kept only as the
+# ranking group id at train time and the split key — never fed to the model),
+# and the ``label`` target.
+OUTPUT_COLS = [*FEATURE_COLUMNS, "query", "label"]
 
 
 def build_descriptions(
@@ -53,7 +56,9 @@ def build_descriptions(
         name_rows.join(admin1_names, on=["country_code", "admin1_code"], how="left")
         .with_columns(admin1_name=pl.col("admin1_name").fill_null(""))
         .group_by("geonameid", "country_code", "admin1_code")
-        .agg(pl.col("name").alias("names"), pl.first("admin1_name").alias("admin1_name"))
+        .agg(
+            pl.col("name").alias("names"), pl.first("admin1_name").alias("admin1_name")
+        )
     )
     descriptions: dict[int, str] = {}
     for row in grouped.iter_rows(named=True):
@@ -90,48 +95,60 @@ def build_pairs(
     query_dataset: pl.DataFrame,
     descriptions: dict[int, str],
 ) -> pl.DataFrame:
-    """Turn search results into labelled ``(query, document, ...)`` rows.
+    """Turn search results into labelled feature rows, one per candidate.
 
-    Every retrieved candidate becomes one row, labelled 1 if it is one of the
-    query's gold geonameids and 0 otherwise. Each row also carries the
-    candidate's ``population`` and raw BM25 ``retriever_score`` — the same two
-    numeric features the reranker reads off ``GeonameMatch`` at serve time, so
-    online and offline features are identical. Because every row is a retrieved
-    candidate, a gold place that retrieval missed contributes no positive (the
-    reranker only ever ranks retrieved candidates anyway). Queries where NER
-    found no entity are skipped (nothing to rank), as are candidates without a
-    loaded description.
+    Every retrieved candidate is featurised via :func:`src.rerank.features.build_row`
+    — the same builder the online :class:`~src.rerank.model.Reranker` uses, so
+    train- and serve-time features are identical by construction. The text
+    feature is the query's NER ``entities`` (what the engine actually feeds the
+    reranker), not the raw query. A candidate is labelled 1 if it is one of the
+    query's gold geonameids, else 0, and ``retriever_rank`` is its 0-based
+    position in the retrieved list.
+
+    Every retrieved candidate becomes a row (no negative subsampling). Queries
+    where NER found no entity are skipped (nothing to rank), as are candidates
+    without a loaded description (a gold place retrieval missed contributes no
+    positive — the reranker only ever ranks retrieved candidates anyway).
     """
-    rows: list[tuple] = []
+    rows: list[dict] = []
     for res, qrow in zip(results, query_dataset.iter_rows(named=True)):
         if not res["entities"]:
             continue
         pos_gids = set(qrow["geonameid"])
-        for candidate in res["results"]:
+        entities = " ".join(res["entities"])
+        for rank, candidate in enumerate(res["results"]):
             gid = candidate["geonameid"]
             if gid not in descriptions:
                 continue
-            label = 1 if gid in pos_gids else 0
-            rows.append((
-                res["query"],
-                descriptions[gid],
-                gid,
-                candidate["population"],
-                candidate["retriever_score"],
-                label,
-            ))
+            row = build_row(
+                entities=entities,
+                document=descriptions[gid],
+                population=candidate["population"],
+                retriever_score=candidate["retriever_score"],
+                retriever_rank=rank,
+            )
+            row["query"] = res["query"]
+            row["label"] = 1 if gid in pos_gids else 0
+            rows.append(row)
 
-    return pl.DataFrame(rows, schema=PAIR_SCHEMA, orient="row")
+    if not rows:
+        return pl.DataFrame(schema={c: pl.Float64 for c in OUTPUT_COLS})
+    return pl.DataFrame(rows).select(OUTPUT_COLS)
 
 
-def split(
-    pairs: pl.DataFrame, cfg: RerankConfig
-) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Hold out ``test_size`` of distinct geonameids for test, rest for train.
+def split(pairs: pl.DataFrame, cfg: RerankConfig) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Hold out ``test_size`` of distinct queries for test, rest for train.
+
+    The split unit is the query — the ranking *group* the model learns and is
+    scored within. Holding out whole queries keeps each query's full candidate
+    set on one side of the split, so no query text leaks train↔test and every
+    test group keeps its gold positive. Splitting by geonameid instead would
+    tear a query's candidates across both sets, leaking the query and leaving
+    truncated (or positive-less) test groups that make NDCG uninformative.
     """
-    gids = pairs.select("geonameid").unique(maintain_order=True)
-    test_gids = gids.sample(fraction=cfg.test_size, seed=cfg.seed)
-    is_test = pairs["geonameid"].is_in(test_gids["geonameid"].to_list())
+    queries = pairs.select("query").unique(maintain_order=True)
+    test_queries = queries.sample(fraction=cfg.test_size, seed=cfg.seed)
+    is_test = pairs["query"].is_in(test_queries["query"].to_list())
     train = pairs.filter(~is_test).select(OUTPUT_COLS)
     test = pairs.filter(is_test).select(OUTPUT_COLS)
     return train, test

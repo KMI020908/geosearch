@@ -11,11 +11,8 @@ from __future__ import annotations
 import pandas as pd
 from catboost import CatBoost, Pool
 
+from src.rerank.features import FEATURE_COLUMNS, TEXT_FEATURES, build_row
 from src.search.engine import GeonameMatch
-
-_TEXT_FEATURES = ["query", "document"]
-_NUM_FEATURES = ["population", "retriever_score"]
-_FEATURES = _TEXT_FEATURES + _NUM_FEATURES
 
 
 class Reranker:
@@ -32,26 +29,34 @@ class Reranker:
         return cls(model, descriptions)
 
     def rerank(
-        self, query_text: str, matches: list[GeonameMatch]
+        self, entities: str, matches: list[GeonameMatch]
     ) -> list[tuple[GeonameMatch, float]]:
         """Return ``(match, score)`` pairs sorted by descending model score.
 
-        Candidates without a known description score against an empty document
-        rather than being dropped, so the result set stays the same size. The
-        ``population`` and ``retriever_score`` features come straight off each
-        match, mirroring what :func:`src.rerank.dataset.build_pairs` mines.
+        ``entities`` is the NER spans joined into one string — exactly what the
+        engine passes and what :func:`src.rerank.dataset.build_pairs` mines as the
+        text feature, so train- and serve-time features are identical (via the
+        shared :func:`src.rerank.features.build_row`). ``retriever_rank`` is the
+        candidate's position in the retrieval-ordered ``matches`` list, matching
+        the rank mined at training time. Candidates without a known description
+        score against an empty document rather than being dropped, so the result
+        set stays the same size.
         """
         if not matches:
             return []
-        frame = pd.DataFrame(
-            {
-                "query": [query_text] * len(matches),
-                "document": [self._descriptions.get(m.geonameid, "") for m in matches],
-                "population": [m.population for m in matches],
-                "retriever_score": [m.retriever_score for m in matches],
-            }
+        rows = [
+            build_row(
+                entities=entities,
+                document=self._descriptions.get(m.geonameid, ""),
+                population=m.population,
+                retriever_score=m.retriever_score,
+                retriever_rank=rank,
+            )
+            for rank, m in enumerate(matches)
+        ]
+        pool = Pool(
+            data=pd.DataFrame(rows)[FEATURE_COLUMNS], text_features=TEXT_FEATURES
         )
-        pool = Pool(data=frame[_FEATURES], text_features=_TEXT_FEATURES)
         scores = self._model.predict(pool)
         order = sorted(range(len(matches)), key=lambda i: scores[i], reverse=True)
         return [(matches[i], float(scores[i])) for i in order]
