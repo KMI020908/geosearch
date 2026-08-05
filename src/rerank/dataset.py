@@ -10,7 +10,9 @@ The pipeline mirrors the notebook prototype, cleaned up:
    (:func:`search_batch`) to mine retrieval candidates.
 3. Featurise every retrieved candidate (:func:`build_pairs` via
    :mod:`src.rerank.features`), labelling gold geonameid(s) positive and every
-   other retrieved candidate negative.
+   other retrieved candidate negative. The text features are the query's entity
+   buckets — by default the NER spans the API returns, or the dataset's gold
+   spans when ``RERANK__USE_GOLD_ENTITIES=true`` (see :func:`_entity_buckets`).
 4. Split by query — the ranking group — so no query (and its gold) leaks
    across train/test (:func:`split`) and write both Parquets.
 
@@ -32,7 +34,12 @@ from tqdm import tqdm
 from src.config import RerankConfig, settings
 from src.dataset.sampling import load_admin1_names, load_name_rows
 from src.db.session import AsyncSessionFactory
-from src.rerank.features import FEATURE_COLUMNS, build_row
+from src.rerank.features import (
+    FEATURE_COLUMNS,
+    GOLD_BUCKET_COLS,
+    NAME_SEPARATOR,
+    build_row,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +54,25 @@ def build_descriptions(
 ) -> dict[int, str]:
     """Map each geonameid to a document string: names, country, region.
 
-    All spellings of a place are sorted and space-joined on the first line, the
-    English country name on the second, the admin1 region on the third — the
-    same document a retriever would index for that place.
+    All spellings of a place are sorted and joined on the first line, the English
+    country name on the second, the admin1 region on the third — the same
+    document a retriever would index for that place.
+
+    The spellings are separated by :data:`~src.rerank.features.NAME_SEPARATOR`
+    rather than a plain space so the boundary between them survives: the match
+    features compare the query's spans against each name individually, which a
+    space-joined line makes impossible — and which would dilute the comparison by
+    however many spellings a place happens to have.
     """
     cc_to_name = dict(countries_for_language("en"))
     grouped = (
         name_rows.join(admin1_names, on=["country_code", "admin1_code"], how="left")
-        .with_columns(admin1_name=pl.col("admin1_name").fill_null(""))
+        # Both lines of the description are nullable in the join, and a null
+        # reaching `str.join` below is a TypeError rather than a blank line.
+        .with_columns(
+            admin1_name=pl.col("admin1_name").fill_null(""),
+            country_code=pl.col("country_code").fill_null(""),
+        )
         .group_by("geonameid", "country_code", "admin1_code")
         .agg(
             pl.col("name").alias("names"), pl.first("admin1_name").alias("admin1_name")
@@ -62,8 +80,8 @@ def build_descriptions(
     )
     descriptions: dict[int, str] = {}
     for row in grouped.iter_rows(named=True):
-        names = " ".join(sorted(set(row["names"])))
-        country = cc_to_name.get(row["country_code"], row["country_code"])
+        names = NAME_SEPARATOR.join(sorted(set(row["names"])))
+        country = cc_to_name.get(row["country_code"], row["country_code"]) or ""
         descriptions[row["geonameid"]] = "\n".join(
             [names, country, row["admin1_name"]]
         ).strip()
@@ -90,38 +108,91 @@ def search_batch(queries: list[str], cfg: RerankConfig) -> list[dict]:
     return results
 
 
+def _entity_buckets(res: dict, qrow: dict, use_gold: bool) -> dict[str, str]:
+    """The query's typed entity strings: gold dataset spans or live NER spans.
+
+    ``use_gold=False`` (default) reads ``entity_buckets`` off the API response —
+    the GLiNER spans the engine itself feeds the reranker, which is what keeps
+    train/serve features identical. ``use_gold=True`` reads the dataset's
+    reference spans instead (:data:`~src.rerank.features.GOLD_BUCKET_COLS`),
+    which the generator wrote with the very same ``bucket_entities``, so the two
+    sources are drop-in comparable.
+    """
+    if use_gold:
+        missing = [c for c in GOLD_BUCKET_COLS.values() if c not in qrow]
+        if missing:
+            raise RuntimeError(
+                f"use_gold_entities=True but the query dataset has no {missing} "
+                "column(s) — it predates the gold entity buckets. Regenerate it "
+                "(make dataset) or unset RERANK__USE_GOLD_ENTITIES."
+            )
+        # ``or ""``: build_row needs a str, and a Parquet column may hold nulls.
+        return {name: qrow[col] or "" for name, col in GOLD_BUCKET_COLS.items()}
+
+    # A missing bucket means the API is on an older build that predates the
+    # typed-entity split — replaying against it would silently mislabel the
+    # features. Fail loudly with a fix instead of a bare KeyError.
+    if "entity_buckets" not in res:
+        raise RuntimeError(
+            "Search API response has no 'entity_buckets' field — the server "
+            "is running an outdated build. Restart it on the current code "
+            "(uv run uvicorn src.api.main:app) before running rerank-data."
+        )
+    return res["entity_buckets"]
+
+
 def build_pairs(
     results: list[dict],
     query_dataset: pl.DataFrame,
     descriptions: dict[int, str],
+    *,
+    use_gold_entities: bool = False,
 ) -> pl.DataFrame:
     """Turn search results into labelled feature rows, one per candidate.
 
     Every retrieved candidate is featurised via :func:`src.rerank.features.build_row`
     — the same builder the online :class:`~src.rerank.model.Reranker` uses, so
     train- and serve-time features are identical by construction. The text
-    feature is the query's NER ``entities`` (what the engine actually feeds the
-    reranker), not the raw query. A candidate is labelled 1 if it is one of the
-    query's gold geonameids, else 0, and ``retriever_rank`` is its 0-based
-    position in the retrieved list.
+    features are the query's entity spans split by type, not the raw query:
+    ``entity_buckets`` from the API response (the NER spans the engine actually
+    feeds the reranker) by default, or the dataset's gold spans when
+    ``use_gold_entities`` is set (:func:`_entity_buckets`). A candidate is
+    labelled 1 if it is one of the query's gold geonameids, else 0, and
+    ``retriever_rank`` is its 0-based position in the retrieved list.
+
+    ``use_gold_entities`` is an ablation — "how would the reranker do if NER were
+    perfect?" — and only replaces the *text features*. The candidate set still
+    comes from retrieval driven by the NER spans (the API takes text, not spans),
+    and queries where NER found nothing retrieve nothing and are skipped below.
+    So it does not recover recall lost to NER misses, and the resulting model is
+    not servable: online the reranker always sees NER spans.
 
     Every retrieved candidate becomes a row (no negative subsampling). Queries
     where NER found no entity are skipped (nothing to rank), as are candidates
     without a loaded description (a gold place retrieval missed contributes no
     positive — the reranker only ever ranks retrieved candidates anyway).
     """
+    # Responses line up with dataset rows positionally (see :func:`search_batch`),
+    # and that alignment carries the labels — plus the features themselves under
+    # ``use_gold_entities``. A length mismatch would silently pair the wrong rows.
+    if len(results) != query_dataset.height:
+        raise ValueError(
+            f"got {len(results)} search results for {query_dataset.height} query "
+            "dataset rows — they must line up positionally"
+        )
+
     rows: list[dict] = []
-    for res, qrow in zip(results, query_dataset.iter_rows(named=True)):
+    for res, qrow in zip(results, query_dataset.iter_rows(named=True), strict=True):
         if not res["entities"]:
             continue
         pos_gids = set(qrow["geonameid"])
-        entities = " ".join(res["entities"])
+        entity_buckets = _entity_buckets(res, qrow, use_gold_entities)
         for rank, candidate in enumerate(res["results"]):
             gid = candidate["geonameid"]
             if gid not in descriptions:
                 continue
             row = build_row(
-                entities=entities,
+                **entity_buckets,
                 document=descriptions[gid],
                 population=candidate["population"],
                 retriever_score=candidate["retriever_score"],
@@ -165,10 +236,26 @@ def main() -> None:
     logger.info("Built %d descriptions", len(descriptions))
 
     query_dataset = pl.read_parquet(cfg.query_dataset_path)
+
+    # The mined Parquet carries no marker of which entity source produced it and
+    # the output paths do not differ, so the log line is the only record of the
+    # run's mode — make the ablation impossible to mistake for a real training set.
+    if cfg.use_gold_entities:
+        logger.warning(
+            "Entity source: GOLD spans from %s (RERANK__USE_GOLD_ENTITIES=true). "
+            "This is an ablation — a model trained on it is NOT servable, since "
+            "the online reranker always gets NER spans.",
+            cfg.query_dataset_path,
+        )
+    else:
+        logger.info("Entity source: NER spans (entity_buckets from the API)")
+
     logger.info("Searching %d queries via %s…", query_dataset.height, cfg.search_url)
     results = search_batch(query_dataset["query"].to_list(), cfg)
 
-    pairs = build_pairs(results, query_dataset, descriptions)
+    pairs = build_pairs(
+        results, query_dataset, descriptions, use_gold_entities=cfg.use_gold_entities
+    )
     train, test = split(pairs, cfg)
     train.write_parquet(cfg.train_path)
     test.write_parquet(cfg.test_path)

@@ -21,7 +21,7 @@ from typing import cast
 
 import httpx
 import polars as pl
-from ir_measures import P, RR, Recall, calc
+from ir_measures import RR, P, Recall, calc
 from tqdm import tqdm
 
 from src.config import RerankConfig, settings
