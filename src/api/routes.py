@@ -24,12 +24,13 @@ async def search(
     then the BM25 index retrieves the best matching GeoNames entries, which
     are reordered by the trained reranker (or population sort as a fallback).
     """
-    entities, matches = await engine.search(
+    entities, entity_buckets, matches = await engine.search(
         text, top_k=top_k, session=session, use_rerank=use_rerank
     )
     return SearchResponse(
         query=text,
         entities=entities,
+        entity_buckets=entity_buckets,
         results=[
             GeonameResult(
                 geonameid=m.geonameid,

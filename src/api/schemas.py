@@ -28,5 +28,13 @@ class SearchResponse(BaseModel):
     entities: list[str] = Field(
         description="Geographic entities extracted by NER (empty when use_ner=false)"
     )
+    entity_buckets: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "The NER spans grouped by type (city_entities / country_entities / "
+            "admin1_entities), each a space-joined string. This is what the "
+            "reranker scores, and what the reranker dataset builder mines."
+        ),
+    )
     results: list[GeonameResult]
     total: int
