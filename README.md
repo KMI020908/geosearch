@@ -476,10 +476,10 @@ uv run jupyter lab notebooks/
 
 | Notebook | What it answers |
 |---|---|
-| `retriever_metrics.ipynb` | the full pipeline, reranker on |
-| `retriever_metrics_no_rerank.ipynb` | retrieval alone — the baseline to beat |
-| `retriever_metrics_ideal_rerank.ipynb` | the oracle ceiling: how much is left on the table |
-| `retriever_metrics_rerank_diff.ipynb` | per-query win/loss between rerank and baseline |
+| `pipeline_metrics.ipynb` | the full pipeline, reranker on |
+| `pipeline_metrics_no_rerank.ipynb` | retrieval alone — the baseline to beat |
+| `pipeline_metrics_ideal_rerank.ipynb` | the oracle ceiling: how much is left on the table |
+| `pipeline_latency.ipynb` | the full pipeline, reranker on timing calculation |
 
 Read them against each other, not in isolation. The reranker only reorders the
 retrieved top-*k*, so **`Recall@50` is identical in all of them by construction**
