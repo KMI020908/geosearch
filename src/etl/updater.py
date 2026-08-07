@@ -1,22 +1,34 @@
-"""Apply GeoNames daily delta files (modifications and deletes)."""
+"""Apply GeoNames daily delta files (modifications and deletes).
+
+The corpus is two Parquet files, so a delta is read-modify-write rather than an
+in-place UPDATE: load both frames, merge the modifications, drop the deletes,
+write back. At ~1.3M rows that is seconds, and it keeps the whole staging layer
+as plain files.
+
+The one thing the old schema gave for free was ``ondelete=CASCADE`` on the
+alternate-name foreign key. :func:`src.corpus.cascade_orphans` does it
+explicitly after a geoname delete — otherwise a removed place leaves name
+variants behind that retrieval can still match and hydration then cannot resolve.
+"""
 
 import asyncio
+import logging
 from datetime import date
 from pathlib import Path
 
 import httpx
-from sqlalchemy import delete
+import polars as pl
 
+from src import corpus
 from src.config import settings
-from src.db.models import AlternateName, Geoname
-from src.db.session import AsyncSessionFactory
-from src.etl.loader import BATCH_SIZE, _upsert_alternate_names, _upsert_geonames
 from src.etl.parser import (
-    AlternateNameRow,
-    GeonameRow,
     _ALTNAME_COLS,
     _GEONAME_COLS,
+    AlternateNameRow,
+    GeonameRow,
 )
+
+logger = logging.getLogger(__name__)
 
 GEONAMES_BASE = "https://download.geonames.org/export/dump"
 
@@ -40,7 +52,7 @@ async def _download_delta(client: httpx.AsyncClient, url: str, dest: Path) -> bo
 
 
 def _parse_geoname_delta_line(line: str) -> GeonameRow | None:
-    """Parse one line from modifications-<date>.txt, returning None if not feature_class='P'."""
+    """Parse one modifications-<date>.txt line; None if not feature_class='P'."""
     cols = line.split("\t")
     if len(cols) < 19:
         return None
@@ -49,7 +61,7 @@ def _parse_geoname_delta_line(line: str) -> GeonameRow | None:
     if cols[8] not in _COUNTRY_CODES:
         return None
     row_data = {name: cols[idx] for idx, name in _GEONAME_COLS.items()}
-    return GeonameRow(**row_data)
+    return GeonameRow.model_validate(row_data)
 
 
 def _parse_altname_delta_line(line: str) -> AlternateNameRow | None:
@@ -61,83 +73,29 @@ def _parse_altname_delta_line(line: str) -> AlternateNameRow | None:
     if lang not in settings.languages:
         return None
     row_data = {name: cols[idx] for idx, name in _ALTNAME_COLS.items()}
-    return AlternateNameRow(**row_data)
+    return AlternateNameRow.model_validate(row_data)
 
 
-async def _apply_geoname_deletes(delta_file: Path) -> None:
-    """Delete geoname records listed in a deletes file."""
+def _read_ids(delta_file: Path) -> list[int]:
+    """Read the geonameids listed in a deletes file."""
     ids: list[int] = []
     with delta_file.open("r", encoding="utf-8") as f:
         for line in f:
             cols = line.rstrip("\n").split("\t")
             if cols and cols[0].isdigit():
                 ids.append(int(cols[0]))
-
-    if not ids:
-        return
-
-    async with AsyncSessionFactory() as session:
-        await session.execute(delete(Geoname).where(Geoname.geonameid.in_(ids)))
-        await session.commit()
-    print(f"  Deleted {len(ids)} geoname records")
+    return ids
 
 
-async def _apply_altname_deletes(delta_file: Path) -> None:
-    """Delete alternate name records listed in a deletes file."""
-    ids: list[int] = []
+def _read_rows(delta_file: Path, parse) -> list[dict]:
+    """Parse a modifications file, dropping lines outside our scope."""
+    rows = []
     with delta_file.open("r", encoding="utf-8") as f:
         for line in f:
-            cols = line.rstrip("\n").split("\t")
-            if cols and cols[0].isdigit():
-                ids.append(int(cols[0]))
-
-    if not ids:
-        return
-
-    async with AsyncSessionFactory() as session:
-        await session.execute(
-            delete(AlternateName).where(AlternateName.alternate_name_id.in_(ids))
-        )
-        await session.commit()
-    print(f"  Deleted {len(ids)} alternate name records")
-
-
-async def _apply_geoname_modifications(delta_file: Path) -> None:
-    batch: list[GeonameRow] = []
-    total = 0
-    with delta_file.open("r", encoding="utf-8") as f:
-        for line in f:
-            row = _parse_geoname_delta_line(line.rstrip("\n"))
-            if row is None:
-                continue
-            batch.append(row)
-            if len(batch) >= BATCH_SIZE:
-                await _upsert_geonames(batch)
-                total += len(batch)
-                batch.clear()
-    if batch:
-        await _upsert_geonames(batch)
-        total += len(batch)
-    print(f"  Applied {total} geoname modifications")
-
-
-async def _apply_altname_modifications(delta_file: Path) -> None:
-    batch: list[AlternateNameRow] = []
-    total = 0
-    with delta_file.open("r", encoding="utf-8") as f:
-        for line in f:
-            row = _parse_altname_delta_line(line.rstrip("\n"))
-            if row is None:
-                continue
-            batch.append(row)
-            if len(batch) >= BATCH_SIZE:
-                await _upsert_alternate_names(batch)
-                total += len(batch)
-                batch.clear()
-    if batch:
-        await _upsert_alternate_names(batch)
-        total += len(batch)
-    print(f"  Applied {total} alternate name modifications")
+            row = parse(line.rstrip("\n"))
+            if row is not None:
+                rows.append(row.model_dump())
+    return rows
 
 
 async def apply_daily_delta(delta_date: date | None = None) -> None:
@@ -155,34 +113,73 @@ async def apply_daily_delta(delta_date: date | None = None) -> None:
         "altname_deletes": f"alternateNamesDeletes-{date_str}.txt",
     }
 
-    print(f"Downloading delta files for {date_str}...")
+    logger.info("Downloading delta files for %s…", date_str)
     async with httpx.AsyncClient(timeout=120) as client:
-        for key, filename in delta_files.items():
+        for filename in delta_files.values():
             url = f"{GEONAMES_BASE}/{filename}"
             dest = data_dir / filename
             ok = await _download_delta(client, url, dest)
-            print(f"  {filename}: {'downloaded' if ok else 'not available'}")
+            logger.info("  %s: %s", filename, "downloaded" if ok else "not available")
 
-    print("Applying deletes...")
+    geonames = corpus.load_geonames(settings)
+    alternate_names = corpus.load_alternate_names(settings)
+    before = (geonames.height, alternate_names.height)
+
     delete_path = data_dir / delta_files["deletes"]
     if delete_path.exists():
-        await _apply_geoname_deletes(delete_path)
+        ids = _read_ids(delete_path)
+        geonames = corpus.apply_deletes(geonames, ids, key="geonameid")
+        # The FK cascade, made explicit.
+        alternate_names = corpus.cascade_orphans(alternate_names, geonames)
+        logger.info("  deletes: %d geonameids", len(ids))
 
     altname_delete_path = data_dir / delta_files["altname_deletes"]
     if altname_delete_path.exists():
-        await _apply_altname_deletes(altname_delete_path)
+        ids = _read_ids(altname_delete_path)
+        alternate_names = corpus.apply_deletes(
+            alternate_names, ids, key="alternate_name_id"
+        )
+        logger.info("  deletes: %d alternate names", len(ids))
 
-    print("Applying modifications...")
     mod_path = data_dir / delta_files["modifications"]
     if mod_path.exists():
-        await _apply_geoname_modifications(mod_path)
+        rows = _read_rows(mod_path, _parse_geoname_delta_line)
+        if rows:
+            incoming = pl.DataFrame(rows, schema_overrides=corpus.GEONAME_SCHEMA)
+            geonames = corpus.upsert(geonames, incoming, key="geonameid")
+        logger.info("  modifications: %d places", len(rows))
 
     altname_mod_path = data_dir / delta_files["altname_modifications"]
     if altname_mod_path.exists():
-        await _apply_altname_modifications(altname_mod_path)
+        rows = _read_rows(altname_mod_path, _parse_altname_delta_line)
+        if rows:
+            incoming = pl.DataFrame(rows, schema_overrides=corpus.ALTNAME_SCHEMA)
+            # Only names for places we actually hold — a modification can arrive
+            # for a geonameid outside our country scope.
+            incoming = incoming.join(
+                geonames.select("geonameid"), on="geonameid", how="semi"
+            )
+            alternate_names = corpus.upsert(
+                alternate_names, incoming, key="alternate_name_id"
+            )
+        logger.info("  modifications: %d alternate names", len(rows))
 
-    print("Delta update complete.")
+    corpus.write(geonames, alternate_names, settings)
+    logger.info(
+        "Places %d -> %d, alternate names %d -> %d",
+        before[0],
+        geonames.height,
+        before[1],
+        alternate_names.height,
+    )
+    logger.info("Re-run `make artifacts` so serving picks the change up.")
+    logger.info("Delta update complete.")
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    asyncio.run(apply_daily_delta())
 
 
 if __name__ == "__main__":
-    asyncio.run(apply_daily_delta())
+    main()

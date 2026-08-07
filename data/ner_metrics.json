@@ -1,0 +1,717 @@
+{
+  "model": "data/gliner-geosearch",
+  "split": "data/ner/val.json",
+  "threshold": 0.4,
+  "queries": 47,
+  "labels": [
+    "CITY",
+    "REGION",
+    "STATE",
+    "COUNTRY"
+  ],
+  "cjk_splitter": true,
+  "evaluated_at": "2026-08-07T08:51:28+00:00",
+  "scores": {
+    "label:CITY": {
+      "gold": 53,
+      "predicted": 55,
+      "tp": 47,
+      "precision": 0.8545,
+      "recall": 0.8868,
+      "f1": 0.8704
+    },
+    "label:REGION": {
+      "gold": 15,
+      "predicted": 5,
+      "tp": 4,
+      "precision": 0.8,
+      "recall": 0.2667,
+      "f1": 0.4
+    },
+    "label:STATE": {
+      "gold": 6,
+      "predicted": 15,
+      "tp": 5,
+      "precision": 0.3333,
+      "recall": 0.8333,
+      "f1": 0.4762
+    },
+    "label:COUNTRY": {
+      "gold": 12,
+      "predicted": 12,
+      "tp": 10,
+      "precision": 0.8333,
+      "recall": 0.8333,
+      "f1": 0.8333
+    },
+    "overall": {
+      "gold": 86,
+      "predicted": 87,
+      "tp": 66,
+      "precision": 0.7586,
+      "recall": 0.7674,
+      "f1": 0.763
+    },
+    "lang:ru": {
+      "gold": 22,
+      "predicted": 22,
+      "tp": 18,
+      "precision": 0.8182,
+      "recall": 0.8182,
+      "f1": 0.8182
+    },
+    "lang:en": {
+      "gold": 21,
+      "predicted": 21,
+      "tp": 17,
+      "precision": 0.8095,
+      "recall": 0.8095,
+      "f1": 0.8095
+    },
+    "lang:tr": {
+      "gold": 24,
+      "predicted": 24,
+      "tp": 17,
+      "precision": 0.7083,
+      "recall": 0.7083,
+      "f1": 0.7083
+    },
+    "lang:zh": {
+      "gold": 19,
+      "predicted": 20,
+      "tp": 14,
+      "precision": 0.7,
+      "recall": 0.7368,
+      "f1": 0.7179
+    }
+  },
+  "baseline": {
+    "model": "urchade/gliner_multi-v2.1",
+    "scores": {
+      "label:CITY": {
+        "gold": 53,
+        "predicted": 46,
+        "tp": 38,
+        "precision": 0.8261,
+        "recall": 0.717,
+        "f1": 0.7677
+      },
+      "label:REGION": {
+        "gold": 15,
+        "predicted": 1,
+        "tp": 1,
+        "precision": 1.0,
+        "recall": 0.0667,
+        "f1": 0.125
+      },
+      "label:STATE": {
+        "gold": 6,
+        "predicted": 14,
+        "tp": 4,
+        "precision": 0.2857,
+        "recall": 0.6667,
+        "f1": 0.4
+      },
+      "label:COUNTRY": {
+        "gold": 12,
+        "predicted": 12,
+        "tp": 10,
+        "precision": 0.8333,
+        "recall": 0.8333,
+        "f1": 0.8333
+      },
+      "overall": {
+        "gold": 86,
+        "predicted": 73,
+        "tp": 53,
+        "precision": 0.726,
+        "recall": 0.6163,
+        "f1": 0.6667
+      },
+      "lang:ru": {
+        "gold": 22,
+        "predicted": 16,
+        "tp": 13,
+        "precision": 0.8125,
+        "recall": 0.5909,
+        "f1": 0.6842
+      },
+      "lang:en": {
+        "gold": 21,
+        "predicted": 19,
+        "tp": 15,
+        "precision": 0.7895,
+        "recall": 0.7143,
+        "f1": 0.75
+      },
+      "lang:tr": {
+        "gold": 24,
+        "predicted": 21,
+        "tp": 14,
+        "precision": 0.6667,
+        "recall": 0.5833,
+        "f1": 0.6222
+      },
+      "lang:zh": {
+        "gold": 19,
+        "predicted": 17,
+        "tp": 11,
+        "precision": 0.6471,
+        "recall": 0.5789,
+        "f1": 0.6111
+      }
+    }
+  },
+  "threshold_sweep": {
+    "0.10": {
+      "gold": 86,
+      "predicted": 88,
+      "tp": 66,
+      "precision": 0.75,
+      "recall": 0.7674,
+      "f1": 0.7586
+    },
+    "0.20": {
+      "gold": 86,
+      "predicted": 88,
+      "tp": 66,
+      "precision": 0.75,
+      "recall": 0.7674,
+      "f1": 0.7586
+    },
+    "0.30": {
+      "gold": 86,
+      "predicted": 87,
+      "tp": 66,
+      "precision": 0.7586,
+      "recall": 0.7674,
+      "f1": 0.763
+    },
+    "0.40": {
+      "gold": 86,
+      "predicted": 87,
+      "tp": 66,
+      "precision": 0.7586,
+      "recall": 0.7674,
+      "f1": 0.763
+    },
+    "0.50": {
+      "gold": 86,
+      "predicted": 85,
+      "tp": 65,
+      "precision": 0.7647,
+      "recall": 0.7558,
+      "f1": 0.7602
+    },
+    "0.60": {
+      "gold": 86,
+      "predicted": 83,
+      "tp": 64,
+      "precision": 0.7711,
+      "recall": 0.7442,
+      "f1": 0.7574
+    },
+    "0.70": {
+      "gold": 86,
+      "predicted": 82,
+      "tp": 63,
+      "precision": 0.7683,
+      "recall": 0.7326,
+      "f1": 0.75
+    }
+  },
+  "errors": [
+    {
+      "language": "en",
+      "text": "new york population",
+      "gold": [
+        [
+          "new york",
+          "CITY"
+        ]
+      ],
+      "predicted": [
+        [
+          "new york",
+          "STATE"
+        ]
+      ]
+    },
+    {
+      "language": "tr",
+      "text": "New York kenti'nde otel var mı?",
+      "gold": [
+        [
+          "New York kenti'nde",
+          "CITY"
+        ]
+      ],
+      "predicted": [
+        [
+          "New York kenti",
+          "CITY"
+        ]
+      ]
+    },
+    {
+      "language": "tr",
+      "text": "Şıracı'nın tarihi hakkında bilgi edinmek istiyorum.",
+      "gold": [
+        [
+          "Şıracı'nın",
+          "CITY"
+        ]
+      ],
+      "predicted": [
+        [
+          "Şıracı",
+          "CITY"
+        ]
+      ]
+    },
+    {
+      "language": "ru",
+      "text": "история Үшакова и курорта Каякент",
+      "gold": [
+        [
+          "Үшакова",
+          "CITY"
+        ],
+        [
+          "курорта Каякент",
+          "CITY"
+        ]
+      ],
+      "predicted": [
+        [
+          "Үшакова",
+          "CITY"
+        ],
+        [
+          "Каякент",
+          "CITY"
+        ]
+      ]
+    },
+    {
+      "language": "tr",
+      "text": "istanbul muratçık oteller",
+      "gold": [
+        [
+          "istanbul",
+          "CITY"
+        ],
+        [
+          "muratçık",
+          "CITY"
+        ]
+      ],
+      "predicted": [
+        [
+          "istanbul",
+          "CITY"
+        ],
+        [
+          "muratçık",
+          "REGION"
+        ]
+      ]
+    },
+    {
+      "language": "zh",
+      "text": "你觉得𠯫尔乔和锦和的教育水平怎么样？",
+      "gold": [
+        [
+          "𠯫尔乔",
+          "CITY"
+        ],
+        [
+          "锦和",
+          "CITY"
+        ]
+      ],
+      "predicted": [
+        [
+          "尔乔",
+          "CITY"
+        ],
+        [
+          "锦和",
+          "CITY"
+        ]
+      ]
+    },
+    {
+      "language": "en",
+      "text": "petrograd st petersburg food",
+      "gold": [
+        [
+          "petrograd",
+          "CITY"
+        ],
+        [
+          "st petersburg",
+          "REGION"
+        ]
+      ],
+      "predicted": [
+        [
+          "petrograd",
+          "CITY"
+        ],
+        [
+          "st petersburg",
+          "CITY"
+        ]
+      ]
+    },
+    {
+      "language": "ru",
+      "text": "отели пекин шаньси",
+      "gold": [
+        [
+          "пекин",
+          "CITY"
+        ],
+        [
+          "шаньси",
+          "REGION"
+        ]
+      ],
+      "predicted": [
+        [
+          "пекин",
+          "CITY"
+        ],
+        [
+          "шаньси",
+          "STATE"
+        ]
+      ]
+    },
+    {
+      "language": "en",
+      "text": "hsi-an shaanxi history",
+      "gold": [
+        [
+          "hsi-an",
+          "CITY"
+        ],
+        [
+          "shaanxi",
+          "REGION"
+        ]
+      ],
+      "predicted": [
+        [
+          "hsi-an",
+          "CITY"
+        ],
+        [
+          "shaanxi",
+          "STATE"
+        ]
+      ]
+    },
+    {
+      "language": "tr",
+      "text": "New York eyaletindeki New York şehrinin nüfusu ne kadar?",
+      "gold": [
+        [
+          "New York eyaletindeki",
+          "REGION"
+        ],
+        [
+          "New York şehrinin",
+          "CITY"
+        ]
+      ],
+      "predicted": [
+        [
+          "New York eyaletindeki",
+          "STATE"
+        ],
+        [
+          "New York şehrinin",
+          "CITY"
+        ]
+      ]
+    },
+    {
+      "language": "zh",
+      "text": "请您介绍一下广州在广东省的历史发展历程。",
+      "gold": [
+        [
+          "广州",
+          "CITY"
+        ],
+        [
+          "广东省",
+          "REGION"
+        ]
+      ],
+      "predicted": [
+        [
+          "广州",
+          "CITY"
+        ],
+        [
+          "广东省",
+          "STATE"
+        ]
+      ]
+    },
+    {
+      "language": "zh",
+      "text": "圣彼得堡 圣彼得堡联邦市 教育",
+      "gold": [
+        [
+          "圣彼得堡",
+          "CITY"
+        ],
+        [
+          "圣彼得堡联邦市",
+          "REGION"
+        ]
+      ],
+      "predicted": [
+        [
+          "圣彼得堡",
+          "CITY"
+        ],
+        [
+          "圣彼得堡",
+          "CITY"
+        ]
+      ]
+    },
+    {
+      "language": "ru",
+      "text": "Погода в Пекине, штат Иллинойс, Соединенные Штаты вызывает у меня любопытство. Я хочу знать, какая сейчас температура и стоит ли ожидать осадков. Также интересует прогноз на следующую неделю, чтобы спланировать поездку.",
+      "gold": [
+        [
+          "Пекине",
+          "CITY"
+        ],
+        [
+          "штат Иллинойс",
+          "STATE"
+        ],
+        [
+          "Соединенные Штаты",
+          "COUNTRY"
+        ]
+      ],
+      "predicted": [
+        [
+          "Пекине",
+          "CITY"
+        ],
+        [
+          "Иллинойс",
+          "STATE"
+        ],
+        [
+          "Соединенные Штаты",
+          "COUNTRY"
+        ]
+      ]
+    },
+    {
+      "language": "tr",
+      "text": "Kazan, Tataristan Cumhuriyeti, Rusya'nın tarihi hakkında ne biliyorsun?",
+      "gold": [
+        [
+          "Kazan",
+          "CITY"
+        ],
+        [
+          "Tataristan Cumhuriyeti",
+          "REGION"
+        ],
+        [
+          "Rusya",
+          "COUNTRY"
+        ]
+      ],
+      "predicted": [
+        [
+          "Kazan",
+          "CITY"
+        ],
+        [
+          "Tataristan Cumhuriyeti",
+          "STATE"
+        ],
+        [
+          "Rusya'nın",
+          "COUNTRY"
+        ]
+      ]
+    },
+    {
+      "language": "ru",
+      "text": "какой транспорт в Пекине, Шаньси, Китай?",
+      "gold": [
+        [
+          "Пекине",
+          "CITY"
+        ],
+        [
+          "Шаньси",
+          "REGION"
+        ],
+        [
+          "Китай",
+          "COUNTRY"
+        ]
+      ],
+      "predicted": [
+        [
+          "Пекине",
+          "CITY"
+        ],
+        [
+          "Шаньси",
+          "STATE"
+        ],
+        [
+          "Китай",
+          "COUNTRY"
+        ]
+      ]
+    },
+    {
+      "language": "tr",
+      "text": "Kazan, Hakkâri, Türkiye'ye taşınmak istiyorum, orası nasıl?",
+      "gold": [
+        [
+          "Kazan",
+          "CITY"
+        ],
+        [
+          "Hakkâri",
+          "REGION"
+        ],
+        [
+          "Türkiye",
+          "COUNTRY"
+        ]
+      ],
+      "predicted": [
+        [
+          "Kazan",
+          "CITY"
+        ],
+        [
+          "Hakkâri",
+          "REGION"
+        ],
+        [
+          "Türkiye'ye",
+          "COUNTRY"
+        ]
+      ]
+    },
+    {
+      "language": "en",
+      "text": "What is the population of Hsi-an, Shaanxi, China?",
+      "gold": [
+        [
+          "Hsi-an",
+          "CITY"
+        ],
+        [
+          "Shaanxi",
+          "REGION"
+        ],
+        [
+          "China",
+          "COUNTRY"
+        ]
+      ],
+      "predicted": [
+        [
+          "Hsi-an",
+          "CITY"
+        ],
+        [
+          "Shaanxi",
+          "STATE"
+        ],
+        [
+          "China",
+          "COUNTRY"
+        ]
+      ]
+    },
+    {
+      "language": "zh",
+      "text": "广州 广东省 中国 酒店",
+      "gold": [
+        [
+          "广州",
+          "CITY"
+        ],
+        [
+          "广东省",
+          "REGION"
+        ],
+        [
+          "中国",
+          "COUNTRY"
+        ]
+      ],
+      "predicted": [
+        [
+          "广州",
+          "CITY"
+        ],
+        [
+          "广东省",
+          "STATE"
+        ],
+        [
+          "中国",
+          "COUNTRY"
+        ]
+      ]
+    },
+    {
+      "language": "zh",
+      "text": "最近圣彼得堡的天气怎么样？我计划去圣彼得堡（圣彼得堡市，俄罗斯）旅行，想了解当地的气候和降水情况。",
+      "gold": [
+        [
+          "圣彼得堡",
+          "CITY"
+        ],
+        [
+          "圣彼得堡市",
+          "REGION"
+        ],
+        [
+          "俄罗斯",
+          "COUNTRY"
+        ]
+      ],
+      "predicted": [
+        [
+          "圣彼得堡",
+          "CITY"
+        ],
+        [
+          "圣彼得堡",
+          "CITY"
+        ],
+        [
+          "圣彼得堡",
+          "CITY"
+        ],
+        [
+          "俄罗斯",
+          "COUNTRY"
+        ]
+      ]
+    }
+  ]
+}

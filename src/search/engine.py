@@ -1,23 +1,26 @@
 import asyncio
+import json
 import logging
-import pickle
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 from gliner import GLiNER
-from sqlalchemy import select, union
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.config import Settings
-from src.db.models import AlternateName, Geoname
+from src.ner.tokenizer import CjkAwareSplitter
+from src.rerank.features import bucket_entities
 from src.search.bm25 import BM25Index
+from src.search.places import ParquetPlaceStore, PlaceStore
+
+if TYPE_CHECKING:
+    # Type-only: the runtime import lives inside `_load_reranker`, which is what
+    # breaks the engine↔rerank import cycle. Without this the quoted annotation
+    # below names nothing at all.
+    from src.rerank.model import Reranker
 
 logger = logging.getLogger(__name__)
-
-# Bumped when the pickled index layout changes, so a stale file on disk is
-# rebuilt instead of failing at query time.
-_INDEX_FORMAT = 5
 
 # One BM25 document: a name and every (geonameid, population) it resolves to.
 # Population rides along so each geonameid's own population is available for
@@ -40,6 +43,37 @@ class GeonameMatch:
     retriever_score: float
 
 
+@dataclass(frozen=True)
+class EntitySpan:
+    """One NER span, with the character offsets GLiNER reported.
+
+    The offsets are dropped from ``entities`` (which is just the texts) but kept
+    here, because a UI that highlights spans in the original text needs them and
+    cannot recover them by searching — a span's surface form can occur more than
+    once, and the second occurrence is not the one the model tagged.
+    """
+
+    text: str
+    label: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    """Everything one :meth:`SearchEngine.search` call produced.
+
+    A dataclass rather than a tuple because the field count grew past what a
+    positional unpack reads clearly, and because ``spans`` is additive: callers
+    that only want the ranked results are unaffected by its presence.
+    """
+
+    entities: list[str]
+    entity_buckets: dict[str, str]
+    spans: list[EntitySpan]
+    ranked: list[tuple[GeonameMatch, float]]
+
+
 class SearchEngine:
     """NER + BM25 search over GeoNames populated places.
 
@@ -54,12 +88,15 @@ class SearchEngine:
         ner: GLiNER,
         index: BM25Index,
         corpus: list[NameGroup],
+        places: PlaceStore,
         settings: Settings,
         reranker: "Reranker | None" = None,
     ) -> None:
         self._ner = ner
         self._index = index
         self._corpus = corpus
+        # How retrieved geonameids become displayable results.
+        self._places = places
         self._settings = settings
         # None until a trained model is saved; the endpoint's use_rerank flag
         # falls back to plain retriever order while it is absent (e.g. during the
@@ -71,173 +108,256 @@ class SearchEngine:
     # ------------------------------------------------------------------
 
     @classmethod
-    async def build(
-        cls, session_factory: async_sessionmaker, settings: Settings
-    ) -> "SearchEngine":
-        """Load corpus from the database, build the BM25 index, load NER model."""
-        t_build = time.perf_counter()
-        index_path = Path(settings.index_path)
-        cached = (
-            await cls._load_cached_index(index_path)
-            if index_path.exists() and settings.index_warm_start
-            else None
-        )
-        if cached is not None:
-            corpus, index = cached
-        else:
-            logger.info("Loading corpus from database…")
-            t0 = time.perf_counter()
-            corpus, documents = await cls._load_corpus(session_factory, settings)
-            logger.info("Corpus loaded: %d documents (%.3fs)", len(corpus), time.perf_counter() - t0)
+    async def build(cls, settings: Settings) -> "SearchEngine":
+        """Build the engine from the prebuilt artifacts.
 
-            logger.info("Building BM25 index…")
-            t0 = time.perf_counter()
-            index: BM25Index = await asyncio.to_thread(BM25Index, documents)
-            logger.info("BM25 index built (%.3fs) — saving to %s…", time.perf_counter() - t0, index_path)
-            t0 = time.perf_counter()
-            index_path.parent.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(
-                index_path.write_bytes, pickle.dumps((_INDEX_FORMAT, corpus, index))
-            )
-            logger.info("BM25 index saved (%.3fs)", time.perf_counter() - t0)
+        Every check on the way in *raises* rather than falling back to a
+        rebuild: there is no database to rebuild from, so the honest outcome of
+        a stale or half-updated directory is an actionable startup failure, not
+        a silently degraded index that returns wrong results all day.
+        """
+        t_build = time.perf_counter()
+        corpus, index, places = await cls._load_artifacts(settings)
 
         logger.info("Loading NER model %s…", settings.gliner_model)
+        cls._check_ner_meta(settings)
         t0 = time.perf_counter()
-        ner: GLiNER = await asyncio.to_thread(
-            GLiNER.from_pretrained, settings.gliner_model
+        # `from_pretrained` is typed as returning the union of every GLiNER
+        # architecture rather than the base class it dispatches from; the cast
+        # names the one interface this module uses.
+        ner = cast(
+            GLiNER,
+            await asyncio.to_thread(GLiNER.from_pretrained, settings.gliner_model),
         )
-        logger.info("NER model loaded (%.3fs)", time.perf_counter() - t0)
+        if settings.ner_cjk_splitter:
+            # Train/serve parity: the fine-tuned checkpoint was trained on this
+            # tokenization and the splitter is not stored in the checkpoint, so
+            # nothing but this line enforces it. See src/ner/tokenizer.py.
+            # The ignore is torch's: data_processor is reached through
+            # nn.Module.__getattr__, typed Tensor | Module, so any attribute on it
+            # is invisible to the type checker.
+            ner.data_processor.words_splitter = CjkAwareSplitter()  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
+        # Log which splitter and threshold are live: both are silent failure modes
+        # (a mismatched splitter only degrades zh), so startup states them.
+        logger.info(
+            "NER model loaded (%.3fs) — %s splitter, threshold %.2f",
+            time.perf_counter() - t0,
+            "CJK-aware" if settings.ner_cjk_splitter else "GLiNER whitespace",
+            settings.ner_threshold,
+        )
 
-        reranker = await cls._load_reranker(session_factory, settings)
+        reranker = await cls._load_reranker(settings)
 
         logger.info("Engine built in %.3fs total", time.perf_counter() - t_build)
-        return cls(ner, index, corpus, settings, reranker)
+        return cls(ner, index, corpus, places, settings, reranker)
 
-    @staticmethod
-    async def _load_cached_index(
-        index_path: Path,
-    ) -> tuple[list[NameGroup], BM25Index] | None:
-        """Return the pickled (corpus, index), or None if it predates _INDEX_FORMAT.
+    @classmethod
+    async def _load_artifacts(
+        cls, settings: Settings
+    ) -> tuple[list[NameGroup], BM25Index, PlaceStore]:
+        """Load the corpus, index and place table from ``artifacts_dir``.
 
-        A payload written under an older corpus layout isn't guaranteed to match
-        the current NameGroup shape, so it's rebuilt rather than trusted.
+        Every check here *raises* rather than falling back to a rebuild: there
+        is no database in this mode to rebuild from, so the honest outcome of a
+        stale or half-updated directory is an actionable startup failure, not a
+        silently degraded index that returns wrong results all day.
         """
-        logger.info("Loading BM25 index from %s…", index_path)
-        t0 = time.perf_counter()
-        payload = await asyncio.to_thread(lambda: pickle.loads(index_path.read_bytes()))
-        if not (isinstance(payload, tuple) and payload[:1] == (_INDEX_FORMAT,)):
-            logger.info("Index at %s is stale — rebuilding", index_path)
-            return None
-        _, corpus, index = payload
-        logger.info(
-            "BM25 index loaded: %d documents (%.3fs)", len(corpus), time.perf_counter() - t0
+        from src.search.artifacts import (
+            artifact_set,
+            check_build_ids,
+            check_manifest,
+            load_index,
+            load_manifest,
         )
-        return corpus, index
+
+        directory = Path(settings.artifacts_dir)
+        paths = artifact_set(directory)
+        logger.info("Loading serving artifacts from %s…", paths.source)
+
+        manifest = load_manifest(paths.manifest)
+        check_manifest(manifest, settings)
+        check_build_ids(paths, manifest)
+
+        t0 = time.perf_counter()
+        index, corpus = await asyncio.to_thread(load_index, paths.index)
+        places = await asyncio.to_thread(ParquetPlaceStore.from_parquet, paths.places)
+        logger.info(
+            "Artifacts loaded: %d names, %d places, build %s (%.3fs)",
+            len(corpus),
+            len(places),
+            manifest.build_id,
+            time.perf_counter() - t0,
+        )
+        return corpus, index, places
+
+    @classmethod
+    def _check_ner_meta(cls, settings: Settings) -> None:
+        """Refuse to serve a checkpoint whose splitter contract we would violate.
+
+        ``ner_meta.json`` is written beside the weights by :mod:`src.ner.train`
+        and records which word splitter the model was trained with. That is the
+        one requirement a GLiNER checkpoint cannot carry itself —
+        ``words_splitter_type`` in ``gliner_config.json`` names only the built-in
+        kinds — and getting it wrong does not raise: the model simply tokenises
+        Chinese differently than it was trained and every zh span quietly
+        disappears (:mod:`src.ner.tokenizer`). Since nothing downstream notices,
+        the mismatch is turned into a startup failure here.
+
+        A checkpoint with no meta file (a zero-shot hub model, or one trained
+        before this existed) is left alone — absence is not evidence of either
+        setting.
+        """
+        from src.ner.train import CJK_SPLITTER_ID
+
+        meta = cls._load_ner_meta(settings)
+        if meta is None:
+            return
+        wants_cjk = meta.get("words_splitter") == CJK_SPLITTER_ID
+        if wants_cjk != settings.ner_cjk_splitter:
+            raise RuntimeError(
+                f"{settings.gliner_model} was trained with "
+                f"words_splitter={meta.get('words_splitter')!r}, but "
+                f"NER_CJK_SPLITTER={settings.ner_cjk_splitter}. Serving this "
+                f"combination degrades Chinese silently — set NER_CJK_SPLITTER="
+                f"{str(wants_cjk).lower()} or point GLINER_MODEL at a matching "
+                "checkpoint."
+            )
 
     @staticmethod
-    async def _load_reranker(
-        session_factory: async_sessionmaker, settings: Settings
-    ) -> "Reranker | None":
+    def _load_ner_meta(settings: Settings) -> dict | None:
+        """Read ``ner_meta.json`` for the configured model, or None if there is none.
+
+        ``gliner_model`` is either a local directory or a hub id, and the guard
+        above has to work for both — a model published to the Hub
+        (:mod:`src.hub.publish`) is exactly the case where nobody can glance at
+        the directory to check. The hub read costs one ~600-byte cached file
+        against the gigabyte of weights being fetched anyway.
+
+        Any failure to *retrieve* the file (absent, offline, private without a
+        token) is treated as "no meta", not as an error: an unavailable record is
+        the pre-existing state, and refusing to boot over it would turn a missing
+        cross-check into an outage.
+        """
+        from src.ner.train import META_FILENAME
+
+        local = Path(settings.gliner_model) / META_FILENAME
+        if local.exists():
+            return json.loads(local.read_text(encoding="utf-8"))
+        if Path(settings.gliner_model).is_dir():
+            return None
+
+        from huggingface_hub import hf_hub_download
+
+        try:
+            downloaded = hf_hub_download(
+                repo_id=settings.gliner_model,
+                filename=META_FILENAME,
+                token=settings.hf_token,
+            )
+        except Exception as exc:  # noqa: BLE001 — any retrieval failure is "no meta"
+            logger.info(
+                "No %s for %s (%s) — skipping the splitter cross-check",
+                META_FILENAME,
+                settings.gliner_model,
+                type(exc).__name__,
+            )
+            return None
+        return json.loads(Path(downloaded).read_text(encoding="utf-8"))
+
+    @staticmethod
+    async def _load_reranker(settings: Settings) -> "Reranker | None":
         """Load the trained reranker if its model file exists, else return None.
 
         Descriptions are the same documents the reranker was trained on
-        (:func:`src.rerank.dataset.build_descriptions`). Absent model = the very
-        first run, before any reranker is trained, so we fall back to population
-        sort. Imported lazily to avoid an engine↔rerank import cycle.
+        (:func:`src.rerank.dataset.build_descriptions`), read from
+        ``descriptions.parquet`` — the same file ``make rerank-data`` mines
+        against, so the documents a model is scored with are the ones it was
+        fitted on. Absent model = the very first run, before any
+        reranker is trained, so we fall back to population sort. Imported lazily
+        to avoid an engine↔rerank import cycle.
         """
         model_path = Path(settings.rerank.model_path)
         if not model_path.exists():
             logger.info("No reranker at %s — using population sort", model_path)
             return None
 
-        from src.dataset.sampling import load_admin1_names, load_name_rows
-        from src.rerank.dataset import build_descriptions
-        from src.rerank.model import Reranker
+        from src.rerank.model import (
+            Reranker,
+            StaleRerankModelError,
+            load_validated_model,
+        )
 
         logger.info("Loading reranker from %s…", model_path)
         t0 = time.perf_counter()
-        name_rows = await load_name_rows(session_factory, settings)
-        admin1_names = load_admin1_names(settings.geonames_data_dir, settings.countries)
-        descriptions = build_descriptions(name_rows, admin1_names)
-        reranker = await asyncio.to_thread(
-            Reranker.load, str(model_path), descriptions
+        # Validate before building a description per in-scope place: same stance as
+        # a stale index pickle — a model that predates the current feature set is
+        # not trusted, and search degrades to plain retriever order rather than
+        # failing every request. Checking first keeps that cheap.
+        try:
+            model = await asyncio.to_thread(load_validated_model, str(model_path))
+        except StaleRerankModelError as exc:
+            logger.warning("Stale reranker — using retriever order (%s)", exc)
+            return None
+
+        from src.search.artifacts import read_descriptions
+
+        descriptions = await read_descriptions(settings)
+        logger.info(
+            "Reranker loaded: %d descriptions (%.3fs)",
+            len(descriptions),
+            time.perf_counter() - t0,
         )
-        logger.info("Reranker loaded (%.3fs)", time.perf_counter() - t0)
-        return reranker
-
-    @staticmethod
-    async def _load_corpus(
-        session_factory: async_sessionmaker,
-        settings: Settings,
-    ) -> tuple[list[NameGroup], list[str]]:
-        """Group geonameids by name variant — one BM25 document per name.
-
-        Each unique name (name, asciiname or alternate name) maps to every
-        geonameid that carries it, mirroring the notebook's
-        group_by(name).agg(geonameid).  Population rides along on the same union
-        so each geonameid's own population is available for tie-breaking later;
-        the group's BM25 score itself is computed per query, not here.
-        Tokenization into character n-grams happens inside :class:`BM25Index`,
-        so documents stay as plain name strings.
-        """
-
-        async with session_factory() as session:
-            g_filt = [
-                Geoname.country_code.in_(settings.countries),
-                Geoname.feature_code.not_in(settings.excluded_feature_codes)
-            ]
-
-            q1 = select(
-                Geoname.geonameid, Geoname.name.label('name'), Geoname.population
-            ).where(*g_filt)
-
-            q2 = select(
-                Geoname.geonameid, Geoname.asciiname.label('name'), Geoname.population
-            ).where(*g_filt)
-
-            q3 = (
-                select(
-                    Geoname.geonameid,
-                    AlternateName.alternate_name.label('name'),
-                    Geoname.population,
-                )
-                .where(*g_filt, AlternateName.isolanguage.in_(settings.languages))
-                .outerjoin(AlternateName, Geoname.geonameid == AlternateName.geonameid)
-            )
-
-            stmt = union(q1, q2, q3)
-
-            result = await session.execute(stmt)
-            rows = result.all()
-
-        groups: dict[str, list[tuple[int, int]]] = {}
-        for geonameid, name, population in rows:
-            groups.setdefault(name, []).append((geonameid, population or 0))
-
-        documents = list(groups)
-        corpus = [tuple(ids) for ids in groups.values()]
-        return corpus, documents
+        return Reranker(model, descriptions)
 
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
 
-    def _extract_entities(self, text: str) -> list[str]:
-        entities = self._ner.predict_entities(text, self._settings.ner_labels)
-        return [e["text"] for e in entities]
+    def extract_spans(self, text: str) -> list[EntitySpan]:
+        """Run GLiNER and return each span with its label and character offsets.
+
+        The label (one of ``settings.ner_labels``) is kept — not dropped — so the
+        reranker can bucket spans by type (:func:`src.rerank.features.bucket_entities`).
+
+        The decision threshold comes from ``settings.ner_threshold`` (a serving
+        parameter, see :class:`src.config.Settings`); ``flat_ner=True`` is GLiNER's
+        default, stated explicitly because it is what :mod:`src.ner.evaluate`
+        measures. The word splitter was set once in :meth:`build`.
+        """
+        # The ignore is torch's, as on the splitter assignment in `build`: methods
+        # on an nn.Module subclass are reached through `__getattr__`, typed
+        # `Tensor | Module`, so the checker cannot see `predict_entities`.
+        entities = self._ner.predict_entities(  # pyright: ignore[reportCallIssue]
+            text,
+            self._settings.ner_labels,
+            threshold=self._settings.ner_threshold,
+            flat_ner=True,
+        )
+        return [
+            EntitySpan(text=e["text"], label=e["label"], start=e["start"], end=e["end"])
+            for e in entities
+        ]
 
     async def search(
         self,
         text: str,
         top_k: int,
-        session: AsyncSession,
         use_rerank: bool = True,
-    ) -> tuple[list[str], list[tuple[GeonameMatch, float]]]:
-        """Run the full pipeline and return (entities, ranked (match, score) pairs).
+    ) -> SearchResult:
+        """Run the full pipeline, returning a :class:`SearchResult`.
+
+        ``entities`` is the flat list of NER span texts (used for BM25 retrieval and
+        exposed for display); ``entity_buckets`` is the same spans split by type
+        (city/country/admin1) — what the reranker actually scores, and what the
+        dataset builder mines for train/serve parity.
+
+        Takes no database session: hydration goes through :attr:`_places`, which
+        reads the prebuilt places table. That is what lets the whole pipeline
+        run where no database exists.
 
         BM25 scores the best matching *names* for this query; every geonameid
         under a name takes that name's BM25 score as its ``retriever_score``,
-        and only the top-*k* names are hydrated from the database. Retrieval
+        and only the top-*k* names are hydrated. Retrieval
         then *ends* by sorting the full candidate set by ``retriever_score``
         (population breaking homonym ties) and cutting to top-*k* — so retrieval,
         not the reranker, fixes which candidates survive. The reranker is a pure
@@ -251,13 +371,19 @@ class SearchEngine:
         t_total = time.perf_counter()
 
         t0 = time.perf_counter()
-        entities: list[str] = await asyncio.to_thread(self._extract_entities, text)
-        logger.info("NER: %.3fs → %s", time.perf_counter() - t0, entities)
+        spans = await asyncio.to_thread(self.extract_spans, text)
+        entities = [span.text for span in spans]
+        # bucket_entities takes (text, label) pairs — the offsets are for display
+        # only and are not part of what the reranker sees.
+        entity_buckets = bucket_entities([(s.text, s.label) for s in spans])
+        logger.info("NER: %.3fs → %s", time.perf_counter() - t0, spans)
 
         query_text = " ".join(entities)
         if not query_text.strip():
-            logger.info("Total: %.3fs (no entities found)", time.perf_counter() - t_total)
-            return entities, []
+            logger.info(
+                "Total: %.3fs (no entities found)", time.perf_counter() - t_total
+            )
+            return SearchResult(entities, entity_buckets, spans, [])
 
         t0 = time.perf_counter()
         scored_groups: list[tuple[NameGroup, float]] = await asyncio.to_thread(
@@ -266,31 +392,34 @@ class SearchEngine:
         top_ids = _rank_candidates(scored_groups)
         logger.info(
             "Retrieval: %.3fs → %d names, %d candidates",
-            time.perf_counter() - t0, len(scored_groups), len(top_ids),
+            time.perf_counter() - t0,
+            len(scored_groups),
+            len(top_ids),
         )
         if not top_ids:
             logger.info("Total: %.3fs (no matches)", time.perf_counter() - t_total)
-            return entities, []
+            return SearchResult(entities, entity_buckets, spans, [])
 
         t0 = time.perf_counter()
-        stmt = select(Geoname).where(Geoname.geonameid.in_(list(top_ids)))
-        db_result = await session.execute(stmt)
-        geonames_by_id = {g.geonameid: g for g in db_result.scalars()}
-        logger.info("DB fetch: %.3fs → %d rows", time.perf_counter() - t0, len(geonames_by_id))
+        places = await self._places.fetch(list(top_ids))
+        logger.info("Hydration: %.3fs → %d rows", time.perf_counter() - t0, len(places))
 
+        # An id the store cannot resolve is dropped, not defaulted — the store
+        # contract (src/search/places.py). `_check_coverage` in the artifact
+        # builder is what keeps that from silently losing results.
         matches = [
             GeonameMatch(
-                geonameid=g.geonameid,
-                asciiname=g.asciiname,
-                country_code=g.country_code,
-                population=g.population,
-                feature_code=g.feature_code,
-                latitude=g.latitude,
-                longitude=g.longitude,
+                geonameid=p.geonameid,
+                asciiname=p.asciiname,
+                country_code=p.country_code,
+                population=p.population,
+                feature_code=p.feature_code,
+                latitude=p.latitude,
+                longitude=p.longitude,
                 retriever_score=score,
             )
             for gid, score in top_ids.items()
-            if (g := geonames_by_id.get(gid)) is not None
+            if (p := places.get(gid)) is not None
         ]
 
         # --- Retrieval stage ends here ---------------------------------------
@@ -304,25 +433,29 @@ class SearchEngine:
         t0 = time.perf_counter()
         if use_rerank and self._reranker is not None:
             scored = await asyncio.to_thread(
-                self._reranker.rerank, query_text, matches
+                self._reranker.rerank, entity_buckets, matches
             )
             logger.info("Reranker: %.3fs (model)", time.perf_counter() - t0)
         else:
             # No trained reranker (or use_rerank=False): rank by the raw BM25
             # retriever_score itself, so the exposed score is exactly that.
             scored = [(m, m.retriever_score) for m in matches]
-            logger.info("Reranker: %.3fs (retriever-score order)", time.perf_counter() - t0)
+            logger.info(
+                "Reranker: %.3fs (retriever-score order)", time.perf_counter() - t0
+            )
 
         # Population still breaks ties on the final score — model ties are rare,
         # but retriever_score ties among homonyms are common on the no-rerank path.
         scored.sort(key=lambda pair: (pair[1], pair[0].population), reverse=True)
 
-        logger.info("Total: %.3fs → %d results", time.perf_counter() - t_total, len(scored))
-        return entities, scored
+        logger.info(
+            "Total: %.3fs → %d results", time.perf_counter() - t_total, len(scored)
+        )
+        return SearchResult(entities, entity_buckets, spans, scored)
 
 
 def _rank_candidates(scored_groups: list[tuple[NameGroup, float]]) -> dict[int, float]:
-    """Return every geonameid reachable from the retrieved names, with its BM25 retriever score.
+    """Return every geonameid reachable from the retrieved names, with its score.
 
     Every geonameid under a retrieved name takes that name's BM25 score, so
     homonyms tie and rank together; a geonameid reachable under several names

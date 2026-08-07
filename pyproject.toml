@@ -1,38 +1,78 @@
 [project]
 name = "geosearch"
 version = "0.1.0"
-description = "Add your description here"
+description = "Multilingual toponym recognition and matching over GeoNames"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    # `transformers.Trainer` refuses to construct without it, so `make ner-train`
+    # needs it at import time. The old training notebooks pip-installed it inline,
+    # which is why it was never a declared dependency.
+    "accelerate>=1.1.0",
     "aiofiles>=25.1.0",
-    "alembic>=1.18.4",
-    "asyncpg>=0.31.0",
     "catboost>=1.2.10",
     "country-list>=1.1.0",
     "fastapi[standard]>=0.137.1",
     "gliner>=0.2.26",
+    # Declared, not inherited. `src/hub/` and `src/search/engine.py` import it
+    # directly, but it arrives today only as a transitive dep of gliner and
+    # transformers — a release that loosens or drops that pin would break
+    # serving silently. The upper bound is because hub 1.0 was itself a breaking
+    # major and this project's calls are confined to src/hub/client.py.
+    "huggingface-hub>=1.18,<2",
     "httpx>=0.28.1",
+    "ir-measures>=0.4.3",
     "openai>=2.45.0",
+    "pandas>=3.0.3",
     "polars>=1.41.2",
     "pyarrow>=25.0.0",
     "pydantic-settings>=2.14.1",
     "rank-bm25>=0.2.2",
-    "sqlalchemy[asyncio]>=2.0.50",
+    # src/ner/train.py passes `warmup_steps` a value < 1 and relies on it being
+    # read as a ratio — the behaviour transformers 5.1 merged `warmup_ratio` into.
+    # On 4.x that value would mean "one warmup step" instead.
+    "transformers>=5.1",
+    "tqdm>=4.68.1",
     "uvicorn>=0.49.0",
 ]
 
+# `pandas`, `tqdm` and `ir-measures` are imported from `src/` (the reranker
+# frames, every CLI progress bar, and the golden-set metrics), so they are
+# runtime dependencies, not dev tooling — they were in the dev group and a
+# `uv sync` without `--dev` produced an import error rather than a clear message.
 [dependency-groups]
 dev = [
+    # The Space's own dependencies (spaces/geosearch/requirements.txt). Dev-only
+    # because the API does not import them, but here rather than nowhere so the
+    # demo can be run locally before it is pushed — a Space that only ever gets
+    # exercised on the Hub is one whose failures cost a five-minute rebuild.
+    "gradio>=6.0",
+    "plotly>=5.0",
     "ipykernel>=7.2.0",
     "ipywidgets>=8.1.8",
-    "ir-measures>=0.4.3",
-    "pandas>=3.0.3",
+    "pyright>=1.1.400",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
-    "tqdm>=4.68.1",
+    "ruff>=0.9.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+# `OLD/` is superseded scratch work kept only for reference, and `notebooks/`
+# is exploratory — neither is code this project writes.
+exclude = ["OLD", "notebooks"]
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, isort, pep8-naming, pyupgrade, flake8-bugbear.
+select = ["E", "F", "I", "N", "UP", "B"]
+
+[tool.pyright]
+include = ["src"]
+exclude = ["**/__pycache__"]
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"

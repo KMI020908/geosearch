@@ -1,12 +1,11 @@
 import logging
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 from fastapi import FastAPI
 
 from src.api.routes import health_router, router
 from src.config import settings
-from src.db.session import AsyncSessionFactory
 from src.search.engine import SearchEngine
 
 logging.basicConfig(
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Build the search engine once at startup and tear down cleanly."""
     logger.info("Starting up — building search engine…")
-    app.state.engine = await SearchEngine.build(AsyncSessionFactory, settings)
+    app.state.engine = await SearchEngine.build(settings)
     logger.info("Search engine ready — serving requests")
     yield
     logger.info("Shutting down")

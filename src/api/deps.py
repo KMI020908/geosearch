@@ -1,9 +1,7 @@
 from typing import Annotated
 
 from fastapi import Depends, Request
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.session import get_session
 from src.search.engine import SearchEngine
 
 
@@ -12,5 +10,7 @@ def get_engine(request: Request) -> SearchEngine:
     return request.app.state.engine
 
 
-DBSession = Annotated[AsyncSession, Depends(get_session)]
+# No DBSession dependency: `SearchEngine.search` hydrates through its own
+# PlaceStore (src/search/places.py), so a request needs no database session —
+# and in `artifacts` serving mode there is no database to open one against.
 Engine = Annotated[SearchEngine, Depends(get_engine)]

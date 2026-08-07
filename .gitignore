@@ -17,6 +17,38 @@ wheels/
 # Development
 .vscode
 .claude
- 
+
+# Superseded scratch work — kept on disk for reference, never committed.
+# Exploratory notebooks, duplicated datasets and the pre-src/ner training
+# notebooks live here; the training code itself is now src/ner/train.py.
+OLD/
+
 # Models
 catboost_info/
+gliner-geosearch.zip
+gliner-geosearch.zip:Zone.Identifier
+
+# Data lives on the HuggingFace Hub, not in git.
+#
+# `data/*` rather than `data/`: a directory-level ignore short-circuits descent,
+# so the negations below would never be reached.
+#
+# What is out: the GLiNER checkpoint (~1.1GB — GitHub hard-rejects blobs over
+# 100MB, and every re-train would add a full copy to history permanently), the
+# raw GeoNames dumps (309MB, refetchable with `make download`), the staging
+# corpus `make etl` parses them into (intermediate, rebuilt in ~45s), and the
+# compiled artifacts. `make hub-pull` brings back what serving needs;
+# `make hub-pull-all` adds the training corpora.
+#
+# What stays: the small text records of *what* was built. ner_meta.json is the
+# only place a checkpoint's splitter contract is written down, and the metrics
+# files are the only source the published model cards are allowed to quote.
+data/*
+!data/ner_metrics.json
+!data/rerank_metrics.json
+!data/gliner-geosearch/
+data/gliner-geosearch/*
+!data/gliner-geosearch/ner_meta.json
+
+# Notebook scratch output.
+notebooks/*.parquet

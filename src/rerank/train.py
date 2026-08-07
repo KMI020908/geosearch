@@ -1,10 +1,11 @@
 """Train a CatBoost reranker on the labelled pairs from :mod:`src.rerank.dataset`.
 
-The model is a listwise ranker (``YetiRank`` loss) over raw ``query`` and
-``document`` text, grouped per query so ranking is learned within each query's
-candidate set. Both texts are handed to CatBoost as ``text_features`` — it does
-its own tokenisation, so no manual embedding step. Evaluation is NDCG@k on the
-held-out geonameids.
+The model is a listwise ranker (``YetiRank`` loss) over the shared feature set
+from :mod:`src.rerank.features` — the typed entity buckets and ``document`` text
+(handed to CatBoost as ``text_features``, tokenised internally) plus numeric
+features (log-population, retriever score, retriever rank). Rows are grouped per
+query so ranking is learned within each query's candidate set. Evaluation is
+NDCG@k on the held-out queries.
 
 Run as::
 
@@ -20,28 +21,62 @@ import polars as pl
 from catboost import CatBoost, Pool
 
 from src.config import RerankConfig, settings
+from src.rerank.features import FEATURE_COLUMNS, TEXT_FEATURES
 
 logger = logging.getLogger(__name__)
 
-_TEXT_FEATURES = ["query", "document"]
-_NUM_FEATURES = ["population", "retriever_score"]
-_FEATURES = _TEXT_FEATURES + _NUM_FEATURES
+# Word-unigram bag-of-words over each text feature. Two constraints of the typed
+# entity buckets shape this:
+#
+# 1. ``occurrence_lower_bound=1``. CatBoost's default drops tokens occurring fewer
+#    than 3 times; since the spans are split by type, the country/admin1 buckets
+#    are sparse — fragmented further across ru/en/tr/zh spellings of one place —
+#    so no token clears the default floor and the dictionary comes back empty,
+#    aborting training. Keep every token: low-frequency but high-signal name
+#    tokens we *want* the model to match on.
+# 2. No word-``BiGram`` dictionary. ``country_entities`` is structurally a single
+#    token (a country name) and ``admin1_entities`` is often one too, so a
+#    word-level 2-gram dictionary over those columns is empty — CatBoost then
+#    aborts with "Dictionary size is 0". Word unigrams are the robust choice for
+#    these short 0–2 token buckets and already capture the name-token overlap the
+#    reranker matches on.
+#
+# The config is baked into the saved model, so inference applies it too. Only the
+# ``BoW`` calcer is used — CatBoost's other default text calcer, ``NaiveBayes``,
+# is classification-only and rejected under a ``YetiRank`` ranking loss.
+_TEXT_PROCESSING = {
+    "tokenizers": [
+        {"tokenizer_id": "Space", "separator_type": "ByDelimiter", "delimiter": " "}
+    ],
+    "dictionaries": [
+        {"dictionary_id": "Word", "gram_order": "1", "occurrence_lower_bound": "1"},
+    ],
+    "feature_processing": {
+        "default": [
+            {
+                "tokenizers_names": ["Space"],
+                "dictionaries_names": ["Word"],
+                "feature_calcers": ["BoW"],
+            },
+        ]
+    },
+}
 
 
 def to_pool(df: pd.DataFrame) -> Pool:
     """Wrap a train/test frame as a CatBoost ranking Pool.
 
     ``group_id`` is the query (factorised to ints): CatBoost ranks documents
-    within each group, so all rows of one query must share a group. ``query``
-    and ``document`` are text features (CatBoost tokenises them itself);
-    ``population`` and ``retriever_score`` are plain numeric features.
+    within each group, so all rows of one query must share a group — the mined
+    rows are already contiguous per query, so factorising is safe. Features and
+    which of them are text come from :mod:`src.rerank.features`.
     """
     group_id = df["query"].factorize()[0]
     return Pool(
-        data=df[_FEATURES],
+        data=df[FEATURE_COLUMNS],
         label=df["label"],
         group_id=group_id,
-        text_features=_TEXT_FEATURES,
+        text_features=TEXT_FEATURES,
     )
 
 
@@ -56,6 +91,7 @@ def train(train_df: pd.DataFrame, test_df: pd.DataFrame, cfg: RerankConfig) -> C
             "l2_leaf_reg": cfg.l2_leaf_reg,
             "random_seed": cfg.seed,
             "verbose": 100,
+            "text_processing": _TEXT_PROCESSING,
         }
     )
     model.fit(
@@ -84,7 +120,9 @@ def main() -> None:
     # ranking setup), so read the eval history and index it at best_iteration.
     best_it = model.get_best_iteration()
     evals = model.get_evals_result().get("validation", {})
-    scores = {m: seq[best_it] for m, seq in evals.items()} if best_it is not None else {}
+    scores = (
+        {m: seq[best_it] for m, seq in evals.items()} if best_it is not None else {}
+    )
     logger.info("Test scores @ best iter %s: %s", best_it, scores)
 
 

@@ -25,7 +25,9 @@ class GeonameRow(BaseModel):
     timezone: str | None
     modification_date: date | None
 
-    @field_validator("feature_code", "admin1_code", "admin2_code", "timezone", mode="before")
+    @field_validator(
+        "feature_code", "admin1_code", "admin2_code", "timezone", mode="before"
+    )
     @classmethod
     def empty_str_to_none(cls, v: str) -> str | None:
         return v if v else None
@@ -64,7 +66,11 @@ class AlternateNameRow(BaseModel):
         return v if v else None
 
     @field_validator(
-        "is_preferred_name", "is_short_name", "is_colloquial", "is_historic", mode="before"
+        "is_preferred_name",
+        "is_short_name",
+        "is_colloquial",
+        "is_historic",
+        mode="before",
     )
     @classmethod
     def coerce_bool(cls, v: str) -> bool:
@@ -120,7 +126,12 @@ def parse_country_file(country_code: str, data_dir: Path) -> Iterator[GeonameRow
             if cols[6] != "P":
                 continue
             row_data = {name: cols[idx] for idx, name in _GEONAME_COLS.items()}
-            yield GeonameRow(**row_data)
+            # `model_validate`, not `GeonameRow(**row_data)`: every value here is
+            # a raw TSV string and the `mode="before"` validators are what turn
+            # them into int/float/date. The synthesised `__init__` signature
+            # promises the *post*-validation types, so calling it is a type error
+            # for exactly the inputs this parser exists to accept.
+            yield GeonameRow.model_validate(row_data)
 
 
 def parse_alternate_names(
@@ -145,4 +156,4 @@ def parse_alternate_names(
             if lang not in languages:
                 continue
             row_data = {name: cols[idx] for idx, name in _ALTNAME_COLS.items()}
-            yield AlternateNameRow(**row_data)
+            yield AlternateNameRow.model_validate(row_data)

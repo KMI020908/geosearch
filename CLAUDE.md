@@ -9,12 +9,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Setup
+# Setup — serving only (no database, no ETL)
 uv sync --dev && source .venv/bin/activate
 cp .env.example .env
-make up                 # start PostgreSQL (docker compose), waits for healthy
-make migrate             # alembic autogenerate + upgrade head
-make etl                  # download GeoNames files + load into PostgreSQL
+make hub-pull             # fetch serving artifacts + reranker from the Hub
+uv run uvicorn src.api.main:app --reload
+
+# Setup — full authoring pipeline (no database, no Docker)
+make etl                  # download GeoNames dumps + parse them into data/corpus/
+make artifacts            # corpus -> the files serving reads (index, places, descriptions)
+make ner                  # export data -> fine-tune GLiNER -> metrics (needs a GPU)
+
+# Publish (each needs a *write* HF_TOKEN in .env)
+make hub-push-index   # serving artifacts   -> mki0809/geosearch-index
+make hub-push-ner     # fine-tuned GLiNER   -> mki0809/geosearch-ner
+make hub-push-rerank  # CatBoost reranker   -> mki0809/geosearch-reranker
+make hub-push-data    # query dataset etc.  -> mki0809/geosearch-queries
+make hub-push-space   # Gradio demo         -> mki0809/geosearch
 
 # Run the API (builds BM25 index + loads GLiNER on first startup)
 uv run uvicorn src.api.main:app --reload
@@ -27,7 +38,11 @@ make typecheck                     # pyright src
 
 # Data/ML pipelines
 make dataset       # DeepSeek-generated synthetic query dataset (needs DEEPSEEK_API_KEY)
-make rerank-data    # mine labelled (query, document, label) pairs — needs the API running
+make ner-data      # export data/ner/{train,val}.json for the GLiNER fine-tune
+make ner-train     # fine-tune GLiNER, publish the best-span-F1 epoch to data/gliner-geosearch/
+make ner-eval      # span P/R/F1 vs zero-shot baseline + threshold sweep -> data/ner_metrics.json
+make ner           # ner-data -> ner-train -> ner-eval
+make rerank-data    # mine labelled (query, document, label) pairs
 make rerank-train   # fit the CatBoost reranker
 make rerank         # rerank-data -> rerank-train
 
@@ -47,8 +62,126 @@ Input text → GLiNER (NER) → BM25 retrieval (char n-grams) → CatBoost reran
 Everything is wired together in `src/search/engine.py::SearchEngine`, built once in
 the FastAPI `lifespan` (`src/api/main.py`) and shared read-only across requests.
 
-**Retrieval corpus is name-level, not place-level.** `SearchEngine._load_corpus`
-unions three queries (`name`, `asciiname`, in-scope `alternate_name` rows) and groups
+**There is no database.** The pipeline is three file stages:
+
+```
+raw GeoNames dumps  ->  staging corpus  ->  serving artifacts  ->  Hub
+   data/raw/*.zip       data/corpus/*.parquet    data/artifacts/
+   (make download)      (make etl)               (make artifacts)
+```
+
+PostgreSQL was removed because nothing here needed it: one writer, one reader, one
+upstream source, and no query more complex than a filter and a group-by. The whole
+corpus is ~58MB in memory, so streaming it from a server solved a problem this data
+does not have. `src/corpus.py` is the staging layer (two Parquet tables + the
+upsert/delete/cascade operations the daily deltas need);
+`src/search/corpus_queries.py` holds the three projections that used to be SQL — the
+name-spelling union, the places table, and the join feeding `build_descriptions`.
+
+The migration was verified rather than assumed: the artifacts rebuilt from Parquet
+are **identical** to the ones built from Postgres — same 1,187,541 name groups, same
+510,841-entry vocabulary, same 1,300,787 place and description rows, `DataFrame.equals`
+true on both tables. ETL went from ~20 min to 46s, and the staging corpus is 55MB
+against 376MB of Postgres tables.
+
+Hydration lives behind `src/search/places.py::PlaceStore` (a `Protocol`, with
+`ParquetPlaceStore` the only implementation), so `search()` takes no session and
+nothing on the request path opens anything.
+
+**The four artifacts are one set.** `manifest.json` carries a `build_id` stamped into
+each Parquet's footer metadata (*not* the Arrow schema — `pq.read_schema` will not
+see it), plus the `countries`/`languages`/`excluded_feature_codes` the corpus was
+built under. Checked at startup, because every failure here is silent: a places table
+missing a geonameid the index can retrieve does not raise, it drops that place from
+results it should have won; and an index built for two countries served under a
+config naming four simply cannot return the other two.
+
+**The BM25 index is `.npz`, not pickle** (`_INDEX_FORMAT`/`INDEX_FORMAT` = 6), loaded
+with `allow_pickle=False`. The old format was `pickle.dumps` of the object graph —
+arbitrary code execution on a file fetched from a public repo, and something the
+Hub's scanner flags. The postings are a CSR matrix keyed by n-gram rather than
+`rank_bm25`'s 1.19M per-document dicts, which also made `get_scores` ~250-1700×
+faster (measured 2.4s → 1.5ms on `Санкт-Петербург`). `get_scores` keeps
+`rank_bm25`'s outer per-token loop, no de-duplication and all, so the float
+accumulation order is unchanged and scores are **bit-identical** — verified against
+the old index on the real corpus, worst absolute difference 0.0. That exactness is
+load-bearing: `retriever_score` is a trained reranker feature, so drift would move
+the model off its training distribution with nothing raising.
+
+**Hub integration lives in `src/hub/`.** `client.py` is the only module that calls
+`huggingface_hub` (declared explicitly in `pyproject.toml`, not inherited from
+`gliner`); every fetch logs the commit it resolved and every push prints the sha to
+pin, which is how a reported number names the artifact it was measured on
+(`HF__INDEX_REVISION=<sha>`). `publish.py` writes each repo's card from
+`cards.py` — and every number on a card comes from a metrics file this project
+wrote, never a literal, so a card cannot outlive the claim it makes. `arrow.py`
+rewrites polars' `large_string`/`large_list` to the ordinary types on the way out,
+recursively (the query dataset's `entities` column nests them inside a struct), so
+the Dataset Viewer renders; local files are untouched. Five repos rather than one
+because they version independently.
+
+`space/app.py` is the Gradio demo. It ships a *copy of `src/`* rather than
+a reimplementation, so the demo cannot diverge from what is measured; loading runs on
+a daemon thread so the port binds during the 2-5 minute cold start (~1.3GB, and a
+free Space has no persistent storage). It renders reranked and retriever order side
+by side — the comparison is the point.
+
+**The served NER model is fine-tuned, and its tokenization is not in the checkpoint.**
+`settings.gliner_model` defaults to the local directory `data/gliner-geosearch`
+(git-ignored, ~1.1GB, visible to the container through the existing `./data`
+bind-mount, so no hub download happens). `make ner-train` (`src/ner/train.py`) writes
+*there* — `NER__MODEL_DIR` and `GLINER_MODEL` are the same path on purpose, so
+training publishes straight to what the engine loads. It trains on the `data/ner/`
+export, whose token indices were built with `src/ner/tokenizer.py::CjkAwareSplitter` —
+one token per Han ideograph, without which **every** zh span is structurally
+unpredictable (GLiNER classifies token spans, and unicode `\w` makes a run of Han
+characters a single token, so `莫斯科` inside `莫斯科新闻` can neither be trained on
+nor predicted; measured 56/56 zh spans versus 0 for ru/en/tr).
+
+`gliner_config.json` can only name GLiNER's built-in splitters
+(`words_splitter_type: "whitespace"`), so `build()` re-attaches the splitter from
+`settings.ner_cjk_splitter` (default true) and logs which one is live. Because a
+mismatch degrades zh *silently* and nothing downstream notices, training also writes
+**`ner_meta.json`** beside the weights recording the splitter the checkpoint requires,
+and `SearchEngine._check_ner_meta` raises at startup when the configured flag
+disagrees with it. A checkpoint without that file (a hub model, or one from before
+this existed) is left alone — absence is not evidence either way. Serving a zero-shot
+hub checkpoint still means setting the flag false in the same change, since the
+pretrained model never saw per-ideograph tokens.
+
+`settings.ner_threshold` (default `0.4`, below GLiNER's own 0.5) is likewise a serving
+parameter, passed through `_extract_spans`: retrieval is recall-hungry, so the
+operating point sits low deliberately. `make ner-eval --sweep` is where that number is
+*derived* rather than asserted; re-sweep whenever the NER model changes. Swapping the
+NER model also changes what `src/rerank/dataset.py` mines, so the reranker has to be
+re-trained after it (below).
+
+**Model selection is by val span F1, not by `eval_loss`.** `src/ner/train.py`'s
+`BestSpanF1Callback` scores the val split after each epoch the way the engine calls the
+model (`predict_entities` on raw text, via `src/ner/evaluate.py`) and calls
+`save_pretrained` whenever that improves. Saving the live model at the moment it is
+measured also avoids a failure that is silent by construction:
+`load_best_model_at_end=True` makes `transformers.Trainer` reload the best checkpoint
+into the outer `GLiNER` wrapper, whose parameter names carry a `model.` prefix, while
+`GLiNER.save_pretrained` writes the *inner* module's keys unprefixed — every key
+mismatches, `strict=False` swallows it, and what stays in memory is the **last** epoch.
+So `save_strategy="no"` and `load_best_model_at_end=False` are both load-bearing, not
+tidiness. `warmup_steps` is passed a fraction, which `transformers>=5.1` reads as a
+ratio (it absorbed the deprecated `warmup_ratio`); the `>=5.1` floor in `pyproject.toml`
+is what makes that correct.
+
+**`make ner-eval` is the NER gate** (`src/ner/evaluate.py`), the same shape as
+`make rerank-eval`: micro span P/R/F1 on exact `(start, end, label)` matches, bucketed
+`overall` / per label / per language, tuned against the zero-shot baseline measured
+with the *same* splitter (otherwise the zh delta would be an artefact of segmentation,
+not of fine-tuning), plus the threshold sweep. Everything lands in
+`data/ner_metrics.json`. Micro over spans, not macro over queries: a query naming three
+cities feeds three names into retrieval. The support (`gold`/`pred` counts) is printed
+next to every rate because the val split is ~47 queries — a bucket like `label:STATE`
+rests on 6 spans and moves by tenths of F1 on one of them.
+
+**Retrieval corpus is name-level, not place-level.** `corpus_queries.name_rows`
+unions three sources (`name`, `asciiname`, in-scope `alternate_name` rows) and groups
 them by the literal name string into a `NameGroup` — a tuple of `(geonameid, population)`
 pairs (it stores population for the tiebreak, *not* a score). So "Moscow" is one BM25
 document backed by every geonameid that carries that string (homonyms included). Its
@@ -66,41 +199,220 @@ term-frequency saturation over shared n-grams — deliberately tolerant of trans
 and fuzzy spelling differences across ru/en/tr/zh, at the cost of losing rare-term
 weighting.
 
-**Index caching.** The BM25 index + corpus are pickled together
-(`settings.index_path`, versioned by `_INDEX_FORMAT`); a stale format on disk is
-detected and rebuilt rather than trusted. `INDEX_WARM_START` controls whether startup
-loads the cached pickle or rebuilds from the DB (Docker sets this true and bind-mounts
-`./data` so the same pickle is shared between host-run tooling and the container).
+**A stale artifact set raises rather than rebuilding.** There is nothing to rebuild
+*from* at serving time — the corpus lives on the authoring machine — so the honest
+outcome of a stale or half-updated directory is an actionable startup failure, not a
+silently degraded index answering wrongly all day. `make artifacts` is what fixes it.
 
 **Reranker is optional and lazily wired.** `SearchEngine._load_reranker` checks
 whether `settings.rerank.model_path` exists; if not, search falls back to plain
 retriever-order + population-tiebreak (`use_rerank` flag on `/v1/search` and on
 `SearchEngine.search`). `src/rerank/dataset.py` builds training pairs by replaying the
-synthetic query dataset through the *live* search API with `use_rerank=False` (so
-training data never depends on the reranker being trained), using the query's gold
-`geonameid`(s) as positives and top non-gold retrieved candidates as hard negatives.
-`src/rerank/train.py` fits a CatBoost `YetiRank` listwise ranker directly on raw
-`(query, document)` text (CatBoost's own `text_features` tokenization — no manual
-embedding step), grouped per query, evaluated by NDCG@k on held-out geonameids
-(split by geonameid, not by row, so a place never leaks train↔test).
-`src/rerank/model.py::Reranker` is the inference-side wrapper the engine loads; it
-scores against the same `build_descriptions` document text used at training time
-(names + country + admin1 region) to keep online/offline features identical.
+synthetic query dataset through the pipeline with `use_rerank=False` (so training data
+never depends on the reranker being trained), labelling the query's gold `geonameid`(s)
+positive and every other retrieved candidate negative. The replay runs **in process**
+(`src/search/batch.py`) — the same `SearchEngine.search` the endpoint calls, rendered
+through the same `routes.to_response`, so a stale server cannot silently mine features
+from a different pipeline than the one that will serve them. `RERANK__SEARCH_URL` opts
+back into HTTP, which is worth doing only to measure a real deployment; both paths were
+verified to return identical responses over the golden set, reranker on and off. Every candidate is
+featurised by the shared `src/rerank/features.py::build_row` — the same builder the online
+`Reranker` uses, so train/serve features are identical by construction. The text features
+(CatBoost `text_features`) are the NER spans **split by type** —
+`city_entities` / `country_entities` / `admin1_entities` — plus the candidate `document`
+text; the numeric features are `log_population`, `retriever_score`, `retriever_rank` plus
+the `MATCH_FEATURES` block below.
+
+**The typed text split does not, by itself, match a span against a candidate.** CatBoost
+builds a bag of words per text column *independently*, so it never sees the intersection of
+`city_entities` and `document`; learning it would take a pair of splits ("token X in the
+span AND token X in the document") per token, from ~130 training groups. Measured: a model
+trained this way gave all three entity buckets 1.5% of its importance combined, collapsed
+onto `retriever_rank` (76%), and scored *below* the retriever's own order on its own
+training set (NDCG@10 0.8408 vs 0.8428). The overlap is therefore computed explicitly in
+`features.py::MATCH_FEATURES` — city (`exact` / `substr` / char-n-gram `containment` /
+`token_cover`), `country_match`, and admin1 — with `has_country_span` / `has_admin1_span`
+so a real mismatch (0.0) stays distinguishable from "no comparison was possible" (-1.0).
+Matching runs **candidate-name-into-span**, the direction that survives both a bucket
+holding several spans (`multi_city`) and one span wider than the place it names ("Van Gölü"
+→ the city `Van`). Country goes through an ISO code (`country_list`, all `settings.languages`)
+because the document's country line is always English while the span is not. **Known gap:**
+`admin1_name` exists in English only (`admin1CodesASCII.txt`), so the admin1 features work
+for en/tr and read 0 for ru/zh — regions are `feature_class='A'` and the ETL loads only
+`'P'`, so no localised region names were ever ingested.
+
+`build_descriptions` joins a place's spellings with `features.py::NAME_SEPARATOR` (`" | "`),
+not a space: without the boundary each place collapses into one pseudo-name whose n-grams
+are only ~1/n covered by a span naming it once, which would make the feature an
+*inverse*-popularity signal. Separated, each spelling is matched alone and the best wins.
+This is why `data/descriptions.parquet` is **regenerated** by `make artifacts` rather
+than reused: the old `data/rerank_descriptions.parquet` predated both the separator and
+the admin1 line (its rows read `'Bochkino Бочкино\nRussia'`), so serving it would have
+reintroduced exactly that inversion. It has been deleted — nothing reads it.
+
+GLiNER already labels each span (`CITY`/`REGION`/`STATE`/`COUNTRY`);
+`features.py::bucket_entities` maps those labels onto the three columns (`REGION`+`STATE`
+both feed `admin1_entities`, matching the single admin1 line in `document`). The engine
+computes the buckets once and exposes them in the search response's `entity_buckets` field,
+so `dataset.py` mines byte-identical strings — the source of train/serve parity. It is the
+NER spans that feed the reranker, not the raw query. To change the feature set or the
+label→column mapping, edit `src/rerank/features.py`.
+
+`RERANK__USE_GOLD_ENTITIES=true` swaps the mined text features for the query dataset's
+`gold_*_entities` columns (`features.py::GOLD_BUCKET_COLS` derives their names from
+`LABEL_BUCKETS`, so the two cannot drift). This is an **ablation** — "how good would the
+reranker be if NER were perfect?" — and it breaks train/serve parity on purpose, so a
+model trained this way must not be served. It defaults to **false**; it shipped as `true`
+once, and the served `rerank_model.cbm` was silently the non-servable ablation — trained on
+clean gold spans, given GLiNER spans online. If a reranker measures below baseline, check
+this flag first. It is also only a partial ablation: the
+candidate set still comes from retrieval driven by the *NER* spans (`/v1/search` takes
+text, not spans) and queries where NER found nothing still retrieve nothing and are
+skipped, so gold entities cannot recover recall lost to NER misses. The mined Parquet
+records no marker of which source produced it and the output paths don't change — the
+`main()` log line (a WARNING in gold mode) is the only record, so override
+`RERANK__TRAIN_PATH`/`TEST_PATH`/`MODEL_PATH` to keep both runs side by side. `src/rerank/train.py` fits a CatBoost `YetiRank` listwise ranker
+over those features, grouped per query, evaluated by NDCG@k on held-out queries
+(split by query — the ranking group — so a query and its gold never leak
+train↔test; splitting by geonameid would tear a query's candidates across both
+sets, leaking the query and leaving positive-less test groups). `make rerank-eval`
+(`src/rerank/evaluate.py`) is the golden-set gate: rerank vs retriever baseline vs the
+ideal (oracle) ceiling. `src/rerank/model.py::Reranker` is the inference-side wrapper the
+engine loads; the `document` is `build_descriptions` text (names + country + admin1).
 
 **Synthetic query dataset** (`src/dataset/`) feeds both the reranker and retrieval
-evaluation notebooks — not reranker-specific. `sampling.py` does population-stratified
-sampling per `(language, country)` from Postgres (most/least populous + random middle,
-so obscure villages are represented alongside capitals); `generate.py` sends one
-DeepSeek call per sampled name concurrently, checkpointing completed rows to JSONL so
-an interrupted run warm-starts instead of re-paying for finished rows.
+evaluation notebooks — not reranker-specific. `sampling.py` builds the plan (one row
+per intended LLM call) from the staging corpus; `generate.py` sends one DeepSeek call per plan
+row concurrently, checkpointing completed rows to JSONL so an interrupted run
+warm-starts instead of re-paying for finished rows. `make dataset-plan`
+(`--plan-only`) builds and prints the plan without spending a single API token — it
+needs `make etl` to have run, but no `DEEPSEEK_API_KEY`.
 
-**DB schema** (`src/db/models.py`) is two tables: `Geoname` (one row per populated
-place, `feature_class='P'` only, natural `geonameid` PK from GeoNames — never a
-generated UUID) and `AlternateName` (language-tagged name variants, FK to
-`Geoname.geonameid` with `ondelete=CASCADE`, plus a `source` column distinguishing
-GeoNames-original rows from anything this project generates). ETL (`src/etl/`) only
-loads `ru`/`en`/`tr`/`zh` + a few structural language codes, and only `feature_class='P'`
-— see `.claude/CLAUDE.md` for the full GeoNames field reference and data-quality caveats.
+**Prompts are per query type, and the output is structured.** `src/dataset/prompts.py`
+holds one system prompt per `sample_source` (`PROMPTS`, keyed exactly by the kinds
+`sampling.py` emits — an unknown kind raises rather than falling back to a generic
+prompt), each stating only its own case, input fields and expected entity set. Each
+`PromptSpec` also declares that entity contract as flags (`needs_admin1` /
+`needs_country` / `multi_city`), and `generate.py::validate_generation` reads those
+*same* flags, so the instruction and the check enforcing it cannot drift apart. The
+response is json — `query`, `entities` (`{text, label}` per span, in the query's own
+inflected surface form) and `confidence`. DeepSeek's json mode does **not** enforce a
+schema server-side (`response_format` supports `json_object` only, and the prompt must
+contain the literal word "json" plus a shape example — both in `_JSON_CONTRACT`), so
+the contract is enforced here: `schemas.py` parses, `validate_generation` counts spans
+per type, and `locate_spans` fills `start`/`end` with `str.find` — never the model.
+A row that fails is retried `max_generation_attempts` times, then written with
+`valid=False` + reason; only valid rows reach the Parquet. Rows that never produced a
+body are persisted the same way, so a row the model reliably mangles is paid for once
+instead of on every warm start. The one failure *not* retried is `BudgetExceededError`
+(`finish_reason="length"`): the same prompt under the same `max_tokens` fails
+identically, so retrying only pays for the reasoning again. What the validator
+deliberately does *not* check: that the city written is the city requested —
+declension changes the surface form ("Москва" → "Москве"), so requiring the requested
+spelling would reject correct Russian and Turkish inflections. The CITY-span count is
+the proxy.
+
+Rows are generated **one `sample_source` group at a time** (`group_order`), and each
+group's first request is sent alone before the rest fan out: DeepSeek's prefix cache is
+populated by a *completed* request, so hitting a cold prefix with `max_workers`
+concurrent requests would miss on every one. `prompt_cache_hit_tokens` /
+`prompt_cache_miss_tokens` are summed per group and logged. `PROMPT_VERSION` is stamped
+into every checkpoint row and is part of the warm-start key, so changing a prompt
+regenerates the rows it would have changed instead of mixing versions; the checkpoint
+is append-only, so stale rows stay on disk and `checkpoint_to_parquet` filters them and
+keeps the last row per `request_id`.
+
+The dataset's `gold_city_entities` / `gold_country_entities` / `gold_admin1_entities`
+columns are those spans bucketed by `src/rerank/features.py::bucket_entities` — the
+same function the engine uses on GLiNER output, so they are directly comparable to the
+live `entity_buckets`. They are for **evaluating** NER and filtering dataset quality.
+The reranker does **not** train on them by default; it mines `entity_buckets` from the
+live API, which is what keeps train/serve parity (above). `RERANK__USE_GOLD_ENTITIES=true`
+switches `dataset.py` onto these columns instead — the deliberate parity break described
+in the reranker block. `generate.py` importing from
+`src.rerank.features` is deliberate: `LABEL_BUCKETS` is the single source of truth for
+"REGION and STATE both mean admin1", and restating that rule in the validator is
+exactly the drift to avoid.
+
+**Every query kind gets the same per-group quota.** The plan is assembled bucket by
+bucket, where a bucket is a `"<sample_source>:<pool>"` key of `config.py::PLAN_KINDS`
+(`sampling.py::KINDS` is asserted to match it). Each bucket runs the same three steps
+per group: build the eligible name pool (`_group_pool`), draw `n_top` from the head +
+`n_mid` sampled from the middle + `n_low` from the tail (`sample_stratified`), then fan
+each picked name out into its concrete targets (`_expand_targets`, capped at
+`n_targets_per_name`). So a bucket's rows per group land in
+`[quota.total, quota.total × n_targets_per_name]` — exactly `quota.total` for the
+buckets whose names have a single target. Quotas live in `DATASET__QUOTAS` as a
+`{kind: GroupQuota}` dict; a pydantic validator requires the key set to be exactly
+`PLAN_KINDS`, because an env override *replaces* the whole dict rather than merging
+into it. `plan_group_counts(plan)` is the verification surface (`make dataset-plan`
+prints it).
+
+**The group key differs per kind, deliberately.** `one_city`, `multi_city`,
+`city_admin1` and every `:unique` bucket are keyed by `(language, country)`.
+`city_country:homonym` and `city_admin1_country:homonym` are keyed by **language
+alone**: their names are homonyms *across* countries, so iterating countries would draw
+the same name once per country it lives in and emit duplicate rows. That is also why
+those two get a larger default quota — 4 groups against the `:unique` buckets' 16, so at
+an equal quota the homonyms would be the minority of the disambiguation block.
+
+`pool` says where a bucket's names come from and is a **plan column, not a new
+`sample_source`**: generation groups rows by `sample_source` to earn DeepSeek's prefix
+cache, and `group_order` intersects with `PROMPTS`, so a source without a prompt would
+be silently dropped from generation entirely. `homonym` names are picked on the axis the
+kind disambiguates along (`n_admin1_in_country > 1` for `city_admin1`, `n_countries > 1`
+for the two country-level kinds — note the admin1 test is **per country**, so a name
+that also exists abroad is still a "two Rostovs in Russia" query). `unique` requires
+uniqueness on *both* axes, so the column never calls a homonym unique and a unique name
+always has exactly one target.
+
+Disambiguation rows (`city_admin1`, `city_country`, `city_admin1_country`) have their
+gold `geonameid` **narrowed** to the named region/country, so the name's other homonyms
+become hard negatives. They are also the rows that populate the otherwise-empty
+`country_entities` / `admin1_entities` reranker features — a `one_city` query rarely
+names a region or country for GLiNER to tag, which is why the `:unique` pools exist:
+the "region/country named → prefer the matching candidate" pattern should not only ever
+be seen on homonyms. Country names are localised per language via `country_list`; region
+names exist only in English (`admin1CodesASCII.txt`), so the prompt asks the LLM to
+render them in the query language.
+
+Two shaping rules inside the fan-out. `region_repeats_city` (computed once in
+`build_place_groups`) drops targets whose region is named after the city itself —
+otherwise the generator is asked for "Шанхай, Шанхай", a query whose region adds no
+disambiguating information. It is applied *before* the `n_targets_per_name` cut so a
+dropped target does not eat a slot, and the pool filters on `has_valid_region` so a name
+with no usable region never eats a quota slot either. The comparison is against
+`asciiname`, not the plan row's `name`, because `admin1_name` is always English while
+the spelling may be in any language. `diversify_country` (only
+`city_admin1_country:homonym`) keeps the most-populous valid region *per country* before
+the cap: ranking by population alone spends both slots on two regions of the same
+country, which shows the model nothing about the country signal.
+
+`multi_city` draws anchor names on the same stratified quota, then joins each with
+`multi_city_extra_min`..`multi_city_extra_max` more cities from the same group; gold =
+the union of the named cities' geonameids, so the reranker sees 2-3 CITY spans in one
+`city_entities` bucket. Expressed as "extra cities" rather than "total cities" so the
+row count equals the quota exactly and a group too small to pair is skipped rather than
+raising.
+
+**The plan is a function of the row *set*, not of row order.** `load_name_rows`' `UNION`
+has no `ORDER BY`, so every aggregation sorts its `geonameid` lists and every ranking
+carries explicit tiebreak keys (ties are the common case — every `population=0` village
+shares a rank). Each group derives its own seed via `blake2b` (never the builtin `hash()`,
+which is salted per process), and `style` / `topic` are drawn from *separate* RNGs so
+adding rows of one kind cannot shift another kind's topics. `request_id` is still
+positional, so a quota change renumbers rows — bump `PROMPT_VERSION` or start from an
+empty checkpoint when quotas change.
+
+**Corpus schema** (`src/corpus.py`) is two Parquet tables mirroring the parser's
+Pydantic rows: `geonames` (one row per populated place, `feature_class='P'` only,
+natural `geonameid` key from GeoNames) and `alternate_names` (language-tagged name
+variants keyed by `alternate_name_id`). The foreign key that used to cascade is now
+`corpus.cascade_orphans`, an anti-join run after a geoname delete — the same
+guarantee, written down instead of delegated. ETL (`src/etl/`) only keeps
+`ru`/`en`/`tr`/`zh` + a few structural language codes, and only `feature_class='P'`
+— see `.claude/CLAUDE.md` for the full GeoNames field reference and data-quality
+caveats.
 
 **Config is centralized** in `src/config.py` (`Settings`, pydantic-settings). Nested
 tunables use `__` env delimiters: `DATASET__*` for `src/dataset/`, `RERANK__*` for
@@ -109,9 +421,16 @@ either is a one-line config change plus a re-run of `make etl` / `make load`.
 
 ## Notes
 
-- Tests (`tests/etl/test_parser.py`) use in-memory zip fixtures only — no DB or network
-  required to run `make test`.
+- The whole suite runs without a DB, a network, a GPU or a trained model: ETL tests use
+  in-memory zip fixtures, and `tests/ner/test_evaluate.py` scores pre-supplied span sets
+  rather than loading GLiNER.
 - `notebooks/` contains exploratory retriever/reranker evaluation notebooks, not part of
-  the served pipeline.
+  the served pipeline. `OLD/` is superseded scratch work (including the pre-`src/ner`
+  training notebooks) kept on disk for reference and git-ignored — nothing there is
+  current, so read `src/` instead.
 - `catboost_info/` (repo root and under `notebooks/`) is CatBoost's own training-log
-  output directory, regenerated on every training run — not source.
+  output directory, regenerated on every training run — not source. `data/ner/` and
+  `data/gliner-geosearch/` are likewise regenerated by `make ner`.
+- Lint/format/type config lives in `pyproject.toml` (`[tool.ruff]`, `[tool.pyright]`).
+  `ruff check`, `ruff format --check`, `pyright src` and `pytest` are all clean —
+  keep them that way rather than adding per-file ignores.
