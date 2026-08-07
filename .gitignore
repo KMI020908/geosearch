@@ -18,15 +18,8 @@ wheels/
 .vscode
 .claude
 
-# Superseded scratch work — kept on disk for reference, never committed.
-# Exploratory notebooks, duplicated datasets and the pre-src/ner training
-# notebooks live here; the training code itself is now src/ner/train.py.
-OLD/
-
 # Models
 catboost_info/
-gliner-geosearch.zip
-gliner-geosearch.zip:Zone.Identifier
 
 # Data lives on the HuggingFace Hub, not in git.
 #
@@ -50,5 +43,3 @@ data/*
 data/gliner-geosearch/*
 !data/gliner-geosearch/ner_meta.json
 
-# Notebook scratch output.
-notebooks/*.parquet
