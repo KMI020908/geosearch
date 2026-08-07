@@ -23,25 +23,25 @@ def _make_zip(filename: str, content: str) -> bytes:
 def _geoname_tsv(**overrides) -> str:
     """Build a valid 19-column tab-separated geoname line."""
     defaults = [
-        "12345",          # 0  geonameid
-        "Москва",         # 1  name
-        "Moskva",         # 2  asciiname
-        "",               # 3  alternatenames (ignored)
-        "55.75",          # 4  latitude
-        "37.62",          # 5  longitude
-        "P",              # 6  feature_class
-        "PPLC",           # 7  feature_code
-        "RU",             # 8  country_code
-        "",               # 9  cc2
-        "77",             # 10 admin1_code
-        "",               # 11 admin2_code
-        "",               # 12 admin3_code
-        "",               # 13 admin4_code
-        "12692466",       # 14 population
-        "0",              # 15 elevation
-        "144",            # 16 dem
+        "12345",  # 0  geonameid
+        "Москва",  # 1  name
+        "Moskva",  # 2  asciiname
+        "",  # 3  alternatenames (ignored)
+        "55.75",  # 4  latitude
+        "37.62",  # 5  longitude
+        "P",  # 6  feature_class
+        "PPLC",  # 7  feature_code
+        "RU",  # 8  country_code
+        "",  # 9  cc2
+        "77",  # 10 admin1_code
+        "",  # 11 admin2_code
+        "",  # 12 admin3_code
+        "",  # 13 admin4_code
+        "12692466",  # 14 population
+        "0",  # 15 elevation
+        "144",  # 16 dem
         "Europe/Moscow",  # 17 timezone
-        "2023-01-15",     # 18 modification_date
+        "2023-01-15",  # 18 modification_date
     ]
     for k, v in overrides.items():
         defaults[int(k)] = v
@@ -56,6 +56,7 @@ def _altname_tsv(alt_id: str, geonameid: str, lang: str, name: str) -> str:
 # ---------------------------------------------------------------------------
 # GeonameRow validation
 # ---------------------------------------------------------------------------
+
 
 def test_geoname_row_parses_valid_line():
     row = GeonameRow(
@@ -107,6 +108,7 @@ def test_geoname_row_empty_optional_fields_become_none():
 # AlternateNameRow validation
 # ---------------------------------------------------------------------------
 
+
 def test_alternate_name_row_parses_flags():
     row = AlternateNameRow(
         alternate_name_id="99",
@@ -141,6 +143,7 @@ def test_alternate_name_row_empty_language_becomes_none():
 # parse_country_file
 # ---------------------------------------------------------------------------
 
+
 def test_parse_country_file_yields_only_feature_class_p(tmp_path):
     lines = [
         _geoname_tsv(**{"6": "P"}),
@@ -165,11 +168,12 @@ def test_parse_country_file_skips_short_lines(tmp_path):
 # parse_alternate_names
 # ---------------------------------------------------------------------------
 
+
 def test_parse_alternate_names_filters_by_id_and_language(tmp_path):
     lines = [
         _altname_tsv("1", "12345", "ru", "Москва"),  # match
         _altname_tsv("2", "12345", "de", "Moskau"),  # wrong language
-        _altname_tsv("3", "99999", "ru", "Other"),   # wrong geoname_id
+        _altname_tsv("3", "99999", "ru", "Other"),  # wrong geoname_id
     ]
     zip_bytes = _make_zip("alternateNamesV2.txt", "\n".join(lines))
     (tmp_path / "alternateNamesV2.zip").write_bytes(zip_bytes)
