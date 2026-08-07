@@ -18,6 +18,11 @@ wheels/
 .vscode
 .claude
 
+# Superseded scratch work — kept on disk for reference, never committed.
+# Exploratory notebooks, duplicated datasets and the pre-src/ner training
+# notebooks live here; the training code itself is now src/ner/train.py.
+OLD/
+
 # Models
 catboost_info/
 gliner-geosearch.zip

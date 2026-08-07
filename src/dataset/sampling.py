@@ -25,7 +25,7 @@ homonyms *across* countries, so iterating countries would draw the same name onc
 per country it lives in. See :data:`KINDS`.
 
 **Everything is derived, not ordered.** The plan is a pure function of the *set*
-of rows the database returns: ``load_name_rows``' ``UNION`` has no ``ORDER BY``,
+of rows the corpus holds: ``load_name_rows`` imposes no order,
 so every aggregation sorts its lists and every ranking carries explicit tiebreak
 keys. A fixed ``cfg.seed`` then reproduces the plan byte for byte, and every
 group draws from an independently derived seed.
@@ -41,11 +41,8 @@ from pathlib import Path
 
 import polars as pl
 from country_list import countries_for_language
-from sqlalchemy import literal, select, union
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.config import PLAN_KINDS, DatasetConfig, GroupQuota, Settings
-from src.db.models import AlternateName, Geoname
 
 _ADMIN1_FILE = "admin1CodesASCII.txt"
 
@@ -116,60 +113,21 @@ def load_admin1_names(data_dir: str, countries: list[str]) -> pl.DataFrame:
     return pl.DataFrame(rows, schema=schema, orient="row")
 
 
-async def load_name_rows(
-    session_factory: async_sessionmaker, settings: Settings
-) -> pl.DataFrame:
+def load_name_rows(settings: Settings) -> pl.DataFrame:
     """Load one row per name spelling for every in-scope populated place.
 
-    The three name sources are unioned into a single ``name``/``isolanguage``
-    shape: the canonical ``name`` and the ``asciiname`` are tagged ``'en'``
-    (that is how GeoNames romanises them), and every alternate name keeps its
-    own language code. Returns a Polars frame with :data:`CITY_ROW_SCHEMA`.
+    Thin alias for :func:`src.search.corpus_queries.name_rows`, which is the same
+    projection the artifact builder indexes over — so the names queries are
+    generated *about* and the names retrieval can *find* are the same set by
+    construction.
 
-    ``asciiname`` also rides along as its own column (not just as one of the
-    unioned spellings): it is the place's English form whatever the spelling's
-    language, which is what the ``region_repeats_city`` flag compares against the
-    English ``admin1_name``. It is functionally dependent on ``geonameid``, so
-    carrying it does not change the ``union``'s DISTINCT semantics.
-
-    Deliberately unordered — an ``ORDER BY`` over millions of rows would cost
-    Postgres time to impose an order the callers do not rely on. Determinism is a
-    property of the Polars pipeline downstream (see the module docstring); this
-    function is shared with ``src.search.engine`` and ``src.rerank.dataset``, so
-    its schema is not free to change.
+    Deliberately unordered; determinism is a property of the Polars pipeline
+    downstream (see the module docstring), which sorts and carries explicit
+    tiebreaks.
     """
-    base = [
-        Geoname.geonameid,
-        Geoname.country_code,
-        Geoname.admin1_code,
-        Geoname.population,
-        Geoname.asciiname,
-    ]
-    geoname_filter = [
-        Geoname.country_code.in_(settings.countries),
-        Geoname.feature_code.not_in(settings.excluded_feature_codes),
-    ]
+    from src.search.corpus_queries import name_rows
 
-    canonical = select(
-        *base, Geoname.name.label("name"), literal("en").label("isolanguage")
-    ).where(*geoname_filter)
-    ascii_ = select(
-        *base, Geoname.asciiname.label("name"), literal("en").label("isolanguage")
-    ).where(*geoname_filter)
-    alternates = (
-        select(
-            *base,
-            AlternateName.alternate_name.label("name"),
-            AlternateName.isolanguage,
-        )
-        .outerjoin(AlternateName, Geoname.geonameid == AlternateName.geonameid)
-        .where(*geoname_filter, AlternateName.isolanguage.in_(settings.languages))
-    )
-
-    async with session_factory() as session:
-        rows = (await session.execute(union(canonical, ascii_, alternates))).all()
-
-    return pl.DataFrame(rows, schema=CITY_ROW_SCHEMA, orient="row")
+    return name_rows(settings).select(CITY_ROW_SCHEMA)
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +166,7 @@ def build_place_groups(
         .group_by("name", "isolanguage", "country_code", "admin1_code")
         .agg(
             # Sorted so the gold list is a function of the row *set*, not of the
-            # order Postgres happened to return.
+            # order the corpus happened to hold.
             pl.col("geonameid").sort(),
             pl.col("admin1_name").first(),
             pl.max("population").alias("max_population"),

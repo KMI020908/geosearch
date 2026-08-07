@@ -57,9 +57,7 @@ async def download_all() -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
 
     print("Downloading country files...")
-    await asyncio.gather(
-        *[download_country(cc, data_dir) for cc in settings.countries]
-    )
+    await asyncio.gather(*[download_country(cc, data_dir) for cc in settings.countries])
 
     print("Downloading alternateNamesV2...")
     await download_alternate_names(data_dir)

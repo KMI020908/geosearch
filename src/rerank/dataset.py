@@ -2,10 +2,11 @@
 
 The pipeline mirrors the notebook prototype, cleaned up:
 
-1. Load one text *description* per in-scope geonameid from the database —
-   sorted name spellings + country + region (:func:`build_descriptions`). This
-   reuses the same name loaders as the query-dataset sampler, so the reranker
-   sees exactly the documents retrieval indexes.
+1. Load one text *description* per in-scope geonameid — sorted name spellings +
+   country + region (:func:`build_descriptions`) — through
+   :func:`src.search.artifacts.read_descriptions`, the same call the engine
+   makes. So the documents a model is *mined against* are the documents it is
+   later *served* with.
 2. Replay every generated query through the live search API
    (:func:`search_batch`) to mine retrieval candidates.
 3. Featurise every retrieved candidate (:func:`build_pairs` via
@@ -16,7 +17,8 @@ The pipeline mirrors the notebook prototype, cleaned up:
 4. Split by query — the ranking group — so no query (and its gold) leaks
    across train/test (:func:`split`) and write both Parquets.
 
-The API server must be running (``RERANK__SEARCH_URL``). Run as::
+Runs in process by default; set ``RERANK__SEARCH_URL`` to replay against a
+live server instead (:mod:`src.search.batch`). Run as::
 
     python -m src.rerank.dataset
 """
@@ -26,20 +28,18 @@ from __future__ import annotations
 import asyncio
 import logging
 
-import httpx
 import polars as pl
 from country_list import countries_for_language
-from tqdm import tqdm
 
 from src.config import RerankConfig, settings
-from src.dataset.sampling import load_admin1_names, load_name_rows
-from src.db.session import AsyncSessionFactory
 from src.rerank.features import (
     FEATURE_COLUMNS,
     GOLD_BUCKET_COLS,
     NAME_SEPARATOR,
     build_row,
 )
+from src.search.artifacts import read_descriptions
+from src.search.batch import search_batch
 
 logger = logging.getLogger(__name__)
 
@@ -86,26 +86,6 @@ def build_descriptions(
             [names, country, row["admin1_name"]]
         ).strip()
     return descriptions
-
-
-def search_batch(queries: list[str], cfg: RerankConfig) -> list[dict]:
-    """Query the live search API once per query, returning the JSON responses.
-
-    Synchronous on purpose: the endpoint is the bottleneck and ordering matters
-    (responses line up with ``queries`` positionally).
-    """
-    results: list[dict] = []
-    with httpx.Client(timeout=cfg.request_timeout) as client:
-        for query in tqdm(queries, unit="q"):
-            response = client.get(
-                cfg.search_url,
-                # use_rerank=False: mine hard negatives from raw retrieval, so
-                # the training set never depends on the reranker it will train.
-                params={"text": query, "top_k": cfg.top_k, "use_rerank": False},
-            )
-            response.raise_for_status()
-            results.append(response.json())
-    return results
 
 
 def _entity_buckets(res: dict, qrow: dict, use_gold: bool) -> dict[str, str]:
@@ -229,11 +209,11 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     cfg = settings.rerank
 
-    logger.info("Loading city descriptions from database…")
-    name_rows = asyncio.run(load_name_rows(AsyncSessionFactory, settings))
-    admin1_names = load_admin1_names(settings.geonames_data_dir, settings.countries)
-    descriptions = build_descriptions(name_rows, admin1_names)
-    logger.info("Built %d descriptions", len(descriptions))
+    # The same file the engine serves from. `descriptions.parquet` is written by
+    # this very `build_descriptions`, so these are not an approximation of the
+    # documents the model will be scored against — they are those documents.
+    descriptions = asyncio.run(read_descriptions(settings))
+    logger.info("Loaded %d descriptions", len(descriptions))
 
     query_dataset = pl.read_parquet(cfg.query_dataset_path)
 

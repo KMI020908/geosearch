@@ -1,6 +1,6 @@
 """Golden-set evaluation: the repeatable rerank-vs-baseline gate.
 
-Replays the hand-curated ``golden_set`` through the live search API twice — once
+Replays the hand-curated ``golden_set`` through the pipeline twice — once
 with the reranker off (retriever + population tiebreak) and once with it on — and
 also computes the *oracle* ceiling (perfectly lifting the gold documents among
 the retrieved candidates). Printing all three side by side answers the only
@@ -8,43 +8,30 @@ question that matters: **does the reranker beat doing nothing, and how far is it
 from the achievable ceiling?**
 
 Consolidates what lived across ``notebooks/retriever_metrics*.ipynb`` into one
-command so every training change is measured identically. The API must be up
-(``RERANK__SEARCH_URL``). Run as::
+command so every training change is measured identically. Runs in process by
+default; set ``RERANK__SEARCH_URL`` to measure a live deployment instead
+(:mod:`src.search.batch`). Run as::
 
     python -m src.rerank.evaluate
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import cast
 
-import httpx
 import polars as pl
 from ir_measures import RR, P, Recall, calc
-from tqdm import tqdm
 
 from src.config import RerankConfig, settings
+from src.search.batch import search_batch
 
 logger = logging.getLogger(__name__)
 
 _MEASURES = [RR, P @ 1, Recall @ 5, Recall @ 10, Recall @ 25, Recall @ 50]
-
-
-def search_batch(
-    queries: list[str], cfg: RerankConfig, *, use_rerank: bool
-) -> list[dict]:
-    """Query the live search API once per query, preserving order."""
-    results: list[dict] = []
-    with httpx.Client(timeout=cfg.request_timeout) as client:
-        for query in tqdm(queries, unit="q"):
-            response = client.get(
-                cfg.search_url,
-                params={"text": query, "top_k": cfg.top_k, "use_rerank": use_rerank},
-            )
-            response.raise_for_status()
-            results.append(response.json())
-    return results
 
 
 def _run_from_order(predictions: list[dict]) -> dict[str, dict[str, float]]:
@@ -101,10 +88,36 @@ def evaluate(cfg: RerankConfig) -> pl.DataFrame:
     return pl.DataFrame(table)
 
 
+def write_metrics(metrics: pl.DataFrame, cfg: RerankConfig) -> Path:
+    """Persist the comparison table as JSON.
+
+    The counterpart to ``NerConfig.metrics_path``: small, git-tracked, and the
+    only place the published model card is allowed to take its numbers from. A
+    card that quotes a figure no file contains is one that keeps quoting it
+    after it stops being true.
+    """
+    systems = [c for c in metrics.columns if c != "metric"]
+    payload = {
+        "evaluated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "golden_set": cfg.golden_set_path,
+        "queries": pl.read_parquet(cfg.golden_set_path).height,
+        "top_k": cfg.top_k,
+        "use_gold_entities": cfg.use_gold_entities,
+        "columns": metrics["metric"].to_list(),
+        "rows": {name: metrics[name].to_list() for name in systems},
+    }
+    path = Path(cfg.metrics_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("Wrote %s", path)
+    return path
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     metrics = evaluate(settings.rerank)
     print(metrics)
+    write_metrics(metrics, settings.rerank)
 
     # Hard gate: the reranker must not lose to the retriever baseline on the
     # top-heavy metrics, or it should not be served.

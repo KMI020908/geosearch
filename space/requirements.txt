@@ -1,0 +1,21 @@
+# Deliberately a subset of pyproject.toml, not a copy.
+#
+# Absent on purpose: fastapi/uvicorn (Gradio calls the engine in-process; a
+# second HTTP hop would buy a second cold start and nothing else), openai
+# (dataset generation), ir-measures (evaluation), accelerate (training). Every
+# megabyte omitted is cold-start time saved.
+
+gradio>=6.0
+gliner>=0.2.26
+transformers>=5.1
+torch
+catboost>=1.2.10
+huggingface-hub>=1.18,<2
+polars>=1.41.2
+pyarrow>=25.0.0
+pandas>=2.0
+numpy
+rank-bm25>=0.2.2
+pydantic-settings>=2.14.1
+country-list>=1.1.0
+plotly>=5.0

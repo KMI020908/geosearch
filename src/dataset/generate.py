@@ -62,7 +62,6 @@ Tunables come from ``settings.dataset``; the API key from
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -93,7 +92,6 @@ from src.dataset.sampling import (
     plan_group_counts,
 )
 from src.dataset.schemas import Entity, GeneratedQuery, parse_response
-from src.db.session import AsyncSessionFactory
 
 # `LABEL_BUCKETS` is the documented single source of truth for the label -> feature
 # column mapping ("REGION and STATE both mean admin1"); importing it — rather than
@@ -694,7 +692,7 @@ def main() -> None:
     cfg = settings.dataset
 
     logger.info("Loading city names from database…")
-    name_rows = asyncio.run(load_name_rows(AsyncSessionFactory, settings))
+    name_rows = load_name_rows(settings)
     admin1_names = load_admin1_names(settings.geonames_data_dir, settings.countries)
     place_groups = build_place_groups(name_rows, admin1_names)
     plan = build_sample_plan(place_groups, build_name_gold(name_rows), settings, cfg)

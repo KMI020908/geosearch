@@ -9,5 +9,5 @@ def char_ngrams(text: str, n: int = 3) -> list[str]:
         if len(word) < n:
             tokens.append(word)
         else:
-            tokens.extend(word[i:i + n] for i in range(len(word) - n + 1))
+            tokens.extend(word[i : i + n] for i in range(len(word) - n + 1))
     return tokens
