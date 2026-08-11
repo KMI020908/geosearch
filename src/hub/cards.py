@@ -139,7 +139,7 @@ This is the first stage of a multilingual toponym search pipeline:
 text
   -> GLiNER (this model)
   -> char-n-gram BM25 retrieval
-  -> CatBoost reranker
+  -> cross-encoder reranker
   -> ranked GeoNames places
 ```
 
@@ -230,8 +230,11 @@ before commercial use.
 def render_reranker_card(
     meta: dict[str, Any], metrics: dict[str, Any] | None, settings: Settings
 ) -> str:
-    """Model card for the CatBoost reranker."""
-    from src.rerank.features import FEATURE_COLUMNS, NAME_SEPARATOR
+    """Model card for the fine-tuned cross-encoder reranker."""
+    from src.rerank.features import NAME_SEPARATOR
+
+    base_model = meta.get("base_model", "unknown")
+    base_url = f"https://huggingface.co/{base_model}"
 
     if metrics:
         rows = ["| system | " + " | ".join(metrics.get("columns", [])) + " |"]
@@ -242,25 +245,40 @@ def render_reranker_card(
     else:
         results = "_Not measured. Run `make rerank-eval`._"
 
-    features = "\n".join(f"{i + 1}. `{c}`" for i, c in enumerate(FEATURE_COLUMNS))
+    hp = meta.get("hyperparameters", {})
+    hp_rows = "\n".join(
+        f"- {name}: {hp.get(key, '?')}"
+        for name, key in (
+            ("epochs", "epochs"),
+            ("batch size", "batch_size"),
+            ("learning rate", "learning_rate"),
+            ("warmup ratio", "warmup_ratio"),
+            ("weight decay", "weight_decay"),
+            ("max length", "max_length"),
+            ("pos_weight (BCE)", "pos_weight"),
+            ("seed", "seed"),
+        )
+    )
 
     return f"""\
 ---
 license: cc-by-4.0
 language: [ru, en, tr, zh]
-tags: [catboost, learning-to-rank, geonames, reranker, toponym]
+library_name: sentence-transformers
+base_model: {base_model}
+tags: [cross-encoder, sentence-transformers, reranker, geonames, toponym]
 ---
 
 # geosearch-reranker
 
-CatboOst `YetiRank` listwise reranker, the last stage of a multilingual toponym
-search pipeline:
+Cross-encoder reranker fine-tuned from [`{base_model}`]({base_url}), the last
+stage of a multilingual toponym search pipeline:
 
 ```
 text
   -> GLiNER NER
   -> char-n-gram BM25 retrieval
-  -> CatBoost reranker (this model)
+  -> cross-encoder reranker (this model)
   -> ranked GeoNames places
 ```
 
@@ -272,31 +290,13 @@ the model only permutes those survivors.
 
 {results}
 
-## Feature contract
+## Input format
 
-The loader validates `feature_names_` against this exact list and refuses a
-model that does not match, so a checkpoint trained on a different feature set
-degrades to retriever order instead of scoring garbage. Published so that
-failure is diagnosable by someone who did not train it:
-
-{features}
-
-Text features (CatBoost `text_features`) are the NER spans **split by type** —
-`city_entities` / `country_entities` / `admin1_entities` — plus the candidate
-`document`.
-
-**The typed split does not by itself match a span against a candidate.**
-CatBoost builds a bag of words per text column independently, so it never sees
-the *intersection* of `city_entities` and `document`. A model trained on the
-split alone gave all three entity buckets 1.5% of its importance combined and
-scored below the retriever's own order. The overlap is therefore computed
-explicitly — the `*_match` / `*_containment` / `*_cover` features above — with
-`has_country_span` / `has_admin1_span` so a real mismatch (`0.0`) stays
-distinguishable from "no comparison was possible" (`-1.0`).
-
-## Document format
-
-The `document` a candidate is scored against is three lines:
+The model scores raw `(query_text, document)` text pairs — no hand-engineered
+features. `query_text` is `" ".join(entities)`, the flat NER span texts joined
+in occurrence order — the exact same string BM25 retrieval scores against, not
+the typed city/country/admin1 split (that split is a display-only field on the
+API response). `document` is three lines:
 
 ```
 <name> {NAME_SEPARATOR.strip()} <name> {NAME_SEPARATOR.strip()} <name>
@@ -305,10 +305,36 @@ The `document` a candidate is scored against is three lines:
 ```
 
 The `{NAME_SEPARATOR!r}` separator is load-bearing. Joined by a space instead,
-a place's spellings collapse into one pseudo-name whose n-grams are only ~1/n
-covered by a span naming it once — which turns the containment feature into an
-*inverse*-popularity signal. Separated, each spelling is matched alone and the
-best wins.
+a place's spellings collapse into one pseudo-name a span naming it once would
+only partially overlap with. Separated, each spelling stands on its own.
+
+A cross-encoder attends jointly over both texts in a single forward pass, so —
+unlike the CatBoost model this project used before — there is no need for
+hand-computed span/document overlap features: the previous model's bag-of-words
+text columns could not see the *intersection* between a query span and the
+document, which is exactly what a cross-encoder's cross-attention computes
+directly.
+
+## Training
+
+Fine-tuned pointwise with `BinaryCrossEntropyLoss` on the mined
+`(query_text, document, label)` pairs (:mod:`src.rerank.dataset`) — one row per
+retrieved candidate, gold geonameid(s) labelled positive, everything else
+negative. `top_k=50` retrieval mines roughly one positive per query against up
+to 50 negatives, so the loss is given a `pos_weight` computed from the train
+split's own class ratio.
+
+{hp_rows}
+- best epoch: {meta.get("best_epoch", "?")}
+- best test P@1: {meta.get("best_p_at_1", "?")}
+- trained at: {meta.get("trained_at", "?")}
+
+Model selection is by P@1 on the held-out mined pairs (grouped by query),
+scored after every epoch and saved on improvement — not by the pointwise
+`eval_loss`, which doesn't reflect whether the top-ranked candidate within a
+query's group is the gold one. Split by **query**, not by place: a query is the
+ranking group, so splitting on geonameid would tear one query's candidates
+across train and test — leaking the query and leaving positive-less test groups.
 
 ## Training provenance
 
@@ -321,23 +347,17 @@ because online the reranker always receives GLiNER spans. A model trained with
 it set must not be served, and this line is on the card so that cannot happen
 silently.
 
-- iterations: {meta.get("iterations", "?")}
-- learning rate: {meta.get("learning_rate", "?")}
-- NDCG@k: {meta.get("ndcg_top", "?")}
-- trained at: {meta.get("trained_at", "?")}
-
-Split by **query**, not by place: a query is the ranking group, so splitting on
-geonameid would tear one query's candidates across train and test — leaking the
-query and leaving positive-less test groups.
-
 ## Known gap
 
-`admin1_name` exists in English only (`admin1CodesASCII.txt`), so the admin1
-features work for `en`/`tr` and read `0` for `ru`/`zh`. Regions are
+`admin1_name` exists in English only (`admin1CodesASCII.txt`), so the
+document's admin1 line rarely matches a ru/zh query lexically. Regions are
 `feature_class='A'` and the ETL loads only `'P'`, so no localised region names
 were ever ingested.
 
 {GEONAMES_ATTRIBUTION.format(**_scope(settings))}
+
+The fine-tune inherits any licence conditions of its base model; check
+[`{base_model}`]({base_url}) before commercial use.
 """
 
 

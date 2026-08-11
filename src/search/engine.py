@@ -266,7 +266,7 @@ class SearchEngine:
 
     @staticmethod
     async def _load_reranker(settings: Settings) -> "Reranker | None":
-        """Load the trained reranker if its model file exists, else return None.
+        """Load the trained reranker if its checkpoint directory exists, else None.
 
         Descriptions are the same documents the reranker was trained on
         (:func:`src.rerank.dataset.build_descriptions`), read from
@@ -281,22 +281,19 @@ class SearchEngine:
             logger.info("No reranker at %s — using population sort", model_path)
             return None
 
-        from src.rerank.model import (
-            Reranker,
-            StaleRerankModelError,
-            load_validated_model,
-        )
+        from sentence_transformers import CrossEncoder
+
+        from src.rerank.model import Reranker
 
         logger.info("Loading reranker from %s…", model_path)
         t0 = time.perf_counter()
-        # Validate before building a description per in-scope place: same stance as
-        # a stale index pickle — a model that predates the current feature set is
-        # not trusted, and search degrades to plain retriever order rather than
-        # failing every request. Checking first keeps that cheap.
+        # Any load failure (a directory that isn't a valid checkpoint, a partial
+        # download, an incompatible sentence-transformers version) degrades to
+        # retriever order rather than failing every request.
         try:
-            model = await asyncio.to_thread(load_validated_model, str(model_path))
-        except StaleRerankModelError as exc:
-            logger.warning("Stale reranker — using retriever order (%s)", exc)
+            model = await asyncio.to_thread(CrossEncoder, str(model_path))
+        except Exception as exc:  # noqa: BLE001 — any load failure degrades, not crashes
+            logger.warning("Could not load reranker — using retriever order (%s)", exc)
             return None
 
         from src.search.artifacts import read_descriptions
@@ -346,10 +343,12 @@ class SearchEngine:
     ) -> SearchResult:
         """Run the full pipeline, returning a :class:`SearchResult`.
 
-        ``entities`` is the flat list of NER span texts (used for BM25 retrieval and
-        exposed for display); ``entity_buckets`` is the same spans split by type
-        (city/country/admin1) — what the reranker actually scores, and what the
-        dataset builder mines for train/serve parity.
+        ``entities`` is the flat list of NER span texts, joined into
+        ``query_text`` — what both BM25 retrieval and the cross-encoder reranker
+        score against, and what the dataset builder mines for train/serve
+        parity. ``entity_buckets`` is the same spans split by type
+        (city/country/admin1); it is a display-only field on the API response,
+        not a reranker input.
 
         Takes no database session: hydration goes through :attr:`_places`, which
         reads the prebuilt places table. That is what lets the whole pipeline
@@ -432,9 +431,7 @@ class SearchEngine:
         # --- Rerank stage: pure reordering of the retrieved top_k ------------
         t0 = time.perf_counter()
         if use_rerank and self._reranker is not None:
-            scored = await asyncio.to_thread(
-                self._reranker.rerank, entity_buckets, matches
-            )
+            scored = await asyncio.to_thread(self._reranker.rerank, query_text, matches)
             logger.info("Reranker: %.3fs (model)", time.perf_counter() - t0)
         else:
             # No trained reranker (or use_rerank=False): rank by the raw BM25

@@ -76,17 +76,32 @@ def pull_index(settings: Settings) -> Path:
 
 
 def pull_reranker(settings: Settings) -> Path:
-    """Fetch ``rerank_model.cbm`` to ``settings.rerank.model_path``."""
+    """Fetch the cross-encoder checkpoint directory to ``settings.rerank.model_path``.
+
+    A sentence-transformers checkpoint is a directory (config.json, weights,
+    tokenizer files, ``rerank_meta.json``), not a single file, so this is a
+    folder fetch + copy like :func:`pull_index`, not the single-file copy the
+    old CatBoost ``.cbm`` needed.
+    """
     destination = Path(settings.rerank.model_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    cached = fetch_folder(
-        settings.hf.reranker_repo,
-        repo_type="model",
-        revision=settings.hf.reranker_revision,
-        settings=settings,
-        allow_patterns=[destination.name, "rerank_meta.json", "rerank_metrics.json"],
-    )
-    shutil.copyfile(cached / destination.name, destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    try:
+        cached = fetch_folder(
+            settings.hf.reranker_repo,
+            repo_type="model",
+            revision=settings.hf.reranker_revision,
+            settings=settings,
+        )
+    except Exception as exc:  # noqa: BLE001 — the raw 401 is actively misleading
+        raise SystemExit(
+            f"Could not fetch {settings.hf.reranker_repo} ({type(exc).__name__}).\n"
+            "  - If it has not been published yet: run `make rerank` then "
+            "`make hub-push-rerank` (needs a write HF_TOKEN).\n"
+            "  - If it is private: set HF_TOKEN in .env.\n"
+            "  - If you meant a different repo: set HF__RERANKER_REPO.\n"
+            "Note the Hub returns 401 for both 'no access' and 'does not exist'."
+        ) from exc
+    shutil.copytree(cached, destination, dirs_exist_ok=True)
     logger.info("Reranker ready at %s", destination)
     return destination
 

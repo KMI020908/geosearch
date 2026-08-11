@@ -66,9 +66,11 @@ def _load() -> None:
             pull_index(settings)
             try:
                 pull_reranker(settings)
-            except Exception as exc:  # noqa: BLE001
+            except (Exception, SystemExit) as exc:  # noqa: BLE001
                 # A missing reranker is a documented degradation, not an outage:
                 # search falls back to retriever order + population tiebreak.
+                # `pull_reranker` raises SystemExit (like `pull_index`) when the
+                # Hub fetch fails — not caught by a bare `except Exception`.
                 logger.warning("No reranker (%s) — using retriever order", exc)
 
         _engine = asyncio.run(SearchEngine.build(settings))
@@ -207,7 +209,7 @@ with gr.Blocks(title="GeoSearch — multilingual toponym search") as demo:
         and returns ranked GeoNames entries.
 
         ```
-        text -> GLiNER NER -> char-n-gram BM25 -> CatBoost reranker -> ranked places
+        text -> GLiNER NER -> char-n-gram BM25 -> cross-encoder reranker -> places
         ```
 
         No database: this Space serves prebuilt artifacts pulled from the Hub.
@@ -231,7 +233,7 @@ with gr.Blocks(title="GeoSearch — multilingual toponym search") as demo:
             label="NER spans", combine_adjacent=True, scale=3
         )
         buckets_out = gr.Code(
-            label="Entity buckets (what the reranker scores)",
+            label="Entity buckets (NER spans by type, for display)",
             language="json",
             scale=2,
         )

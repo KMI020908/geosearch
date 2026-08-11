@@ -10,8 +10,10 @@ dependencies = [
     # which is why it was never a declared dependency.
     "accelerate>=1.1.0",
     "aiofiles>=25.1.0",
-    "catboost>=1.2.10",
     "country-list>=1.1.0",
+    # `CrossEncoderTrainer` (src/rerank/train.py) takes a 🤗 `Dataset`, not a
+    # polars/pandas frame directly.
+    "datasets>=5.0.1",
     "fastapi[standard]>=0.137.1",
     "gliner>=0.2.26",
     # Declared, not inherited. `src/hub/` and `src/search/engine.py` import it
@@ -28,6 +30,12 @@ dependencies = [
     "pyarrow>=25.0.0",
     "pydantic-settings>=2.14.1",
     "rank-bm25>=0.2.2",
+    # src/rerank/{model,train}.py import this directly for the cross-encoder
+    # reranker. torch/transformers/accelerate already arrive transitively via
+    # gliner, but this project declares what it imports directly rather than
+    # relying on a transitive pin that could loosen underneath it (same
+    # reasoning as the huggingface-hub entry above).
+    "sentence-transformers>=5.7.0",
     # src/ner/train.py passes `warmup_steps` a value < 1 and relies on it being
     # read as a ratio — the behaviour transformers 5.1 merged `warmup_ratio` into.
     # On 4.x that value would mean "one warmup step" instead.

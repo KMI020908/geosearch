@@ -264,11 +264,12 @@ class NerConfig(BaseModel):
 
 
 class RerankConfig(BaseModel):
-    """Tunables for building and training the reranker.
+    """Tunables for building and fine-tuning the reranker.
 
     ``rerank-data`` turns the query dataset + live search API into labelled
-    ``(query, document, label)`` pairs; ``rerank-train`` fits a CatBoost ranker
-    on them. Override via env with the ``RERANK__`` prefix.
+    ``(query_text, document, label)`` pairs; ``rerank-train`` fine-tunes a
+    sentence-transformers cross-encoder on them. Override via env with the
+    ``RERANK__`` prefix.
     """
 
     seed: int = 42
@@ -304,7 +305,9 @@ class RerankConfig(BaseModel):
     golden_set_path: str = "data/golden_set.parquet"
     train_path: str = "data/rerank_train.parquet"
     test_path: str = "data/rerank_test.parquet"
-    model_path: str = "data/rerank_model.cbm"
+    # A directory (sentence-transformers `CrossEncoder.save_pretrained()` output —
+    # config.json, weights, tokenizer files), the same shape as `NerConfig.model_dir`.
+    model_path: str = "data/rerank_model"
     # Candidate documents (`build_descriptions` output) as a table, so serving can
     # load them without the database that produced them. Written by
     # `make artifacts`; the reranker cannot score anything without it.
@@ -314,12 +317,33 @@ class RerankConfig(BaseModel):
     # published model card's numbers are allowed to come from.
     metrics_path: str = "data/rerank_metrics.json"
 
-    # CatBoost ranker (YetiRank loss, NDCG eval).
-    iterations: int = 1000
-    learning_rate: float = 0.05
-    l2_leaf_reg: float = 3.0
-    early_stopping_rounds: int = 100
-    ndcg_top: int = 10
+    # --- Cross-encoder fine-tuning --------------------------------------------
+
+    # Zero-shot checkpoint to fine-tune from.
+    base_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    # HF Trainer's own bookkeeping directory (logs, trainer state). The model is
+    # NOT selected from here — see `src.rerank.train.BestRankCallback`.
+    checkpoint_dir: str = "data/rerank/checkpoints"
+    epochs: int = 4
+    batch_size: int = 32
+    learning_rate: float = 2e-5
+    warmup_ratio: float = 0.1
+    weight_decay: float = 0.01
+    # Max token length for a (query_text, document) pair. Sized for the short
+    # entity-span queries and 2-3 line documents this model actually sees.
+    max_length: int = 128
+    # BinaryCrossEntropyLoss `pos_weight`. top_k=50 retrieval with ~1 gold
+    # positive per query means the mined pairs are heavily imbalanced — None
+    # (default) computes it from the train split's own neg/pos row ratio so
+    # the loss does not collapse toward predicting everything negative.
+    pos_weight: float | None = None
+
+    # --- Publishing ------------------------------------------------------------
+
+    # Same reasoning as `NerConfig.push_to_hub`: publishing sends the checkpoint
+    # outside this machine, so it stays opt-in rather than a side effect of
+    # `make rerank-train`.
+    push_to_hub: bool = False
 
 
 class HfConfig(BaseModel):

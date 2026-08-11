@@ -175,5 +175,12 @@ def test_requirements_cover_what_the_app_imports(app) -> None:
     nothing else, so the omission is invisible until deploy.
     """
     requirements = (APP_PATH.parent / "requirements.txt").read_text().lower()
-    for package in ("gradio", "gliner", "polars", "catboost", "plotly", "pandas"):
+    for package in (
+        "gradio",
+        "gliner",
+        "polars",
+        "sentence-transformers",
+        "plotly",
+        "pandas",
+    ):
         assert package in requirements, f"{package} missing from requirements.txt"

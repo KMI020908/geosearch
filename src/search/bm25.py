@@ -103,10 +103,11 @@ class BM25Index:
         * accumulation happens per token into one float64 array, so the
           floating-point summation order is unchanged.
 
-        Both matter because ``retriever_score`` is a *trained* feature of the
-        CatBoost reranker (:mod:`src.rerank.features`): a scoring change that
-        is merely close, rather than identical, silently shifts the model off
-        the distribution it was fitted on.
+        Both matter because ``retriever_score`` decides which candidates
+        survive the retrieval-stage cutoff to top-*k* (:mod:`src.search.engine`)
+        and is the final ranking score whenever no reranker is loaded: a
+        scoring change that is merely close, rather than identical, silently
+        shifts which candidates the reranker ever sees.
 
         What does change is how the per-token document frequencies are found.
         ``rank_bm25`` builds ``[doc.get(q, 0) for doc in self.doc_freqs]``,

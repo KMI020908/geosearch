@@ -1,9 +1,10 @@
 """The CSR index must score *identically* to rank_bm25, not merely closely.
 
-``retriever_score`` is a trained feature of the CatBoost reranker
-(:mod:`src.rerank.features`), so a scoring change that drifts in the last bits
-still moves the model off the distribution it was fitted on — with no error
-anywhere. These tests pin the arithmetic rather than a tolerance.
+``retriever_score`` decides which candidates survive retrieval's top-*k* cutoff
+and is the final ranking score whenever no reranker is loaded
+(:mod:`src.search.engine`), so a scoring change that drifts in the last bits
+still silently shifts results — with no error anywhere. These tests pin the
+arithmetic rather than a tolerance.
 """
 
 import numpy as np

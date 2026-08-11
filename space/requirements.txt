@@ -9,7 +9,7 @@ gradio>=6.0
 gliner>=0.2.26
 transformers>=5.1
 torch
-catboost>=1.2.10
+sentence-transformers>=5.7.0
 huggingface-hub>=1.18,<2
 polars>=1.41.2
 pyarrow>=25.0.0

@@ -27,7 +27,7 @@ English, Turkish or Chinese; it finds the place names and returns ranked
 text
   -> GLiNER NER (fine-tuned)
   -> char-n-gram BM25 retrieval
-  -> CatBoost reranker
+  -> cross-encoder reranker
   -> ranked places
 ```
 

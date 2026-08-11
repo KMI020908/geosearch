@@ -13,7 +13,7 @@ Given free-text input, the system identifies city and populated-place mentions a
 ## Architecture
 
 ```text
-Input text → NER (GLiNER) → BM25 retrieval (char n-grams) → CatBoost reranker → Ranked results
+Input text → NER (GLiNER) → BM25 retrieval (char n-grams) → cross-encoder reranker → Ranked results
 ```
 
 The pipeline is served as a FastAPI app, built once in the `lifespan` and shared
@@ -22,7 +22,7 @@ loads prebuilt artifacts — a character n-gram BM25 index (IDF pinned to 1, so 
 pure term-frequency saturation, deliberately tolerant of transliteration and
 spelling differences across ru/en/tr/zh), a table of places to hydrate results
 from, and the reranker's candidate documents — then the GLiNER model and the
-CatBoost reranker if one has been trained.
+fine-tuned cross-encoder reranker if one has been trained.
 
 **There is no database anywhere in the project.** The pipeline is three file
 stages:
@@ -126,9 +126,9 @@ pipeline feeding a DeepSeek call per query:
    `src/rerank/features.py::bucket_entities`, i.e. directly comparable to the
    `entity_buckets` the live engine produces from GLiNER. They exist to **evaluate**
    NER and to filter dataset quality. The reranker does **not** train on them by
-   default: it keeps mining its features from the live API (see below), which is
-   what preserves train/serve parity. `RERANK__USE_GOLD_ENTITIES=true` points the
-   mining at these columns instead, as an ablation (see below).
+   default: it keeps mining `query_text` from the live API's `entities` (see
+   below), which is what preserves train/serve parity. `RERANK__USE_GOLD_ENTITIES=true`
+   points the mining at these columns instead, as an ablation (see below).
 
 ```bash
 export DEEPSEEK_API_KEY=sk-...   # or add it to .env
@@ -207,16 +207,16 @@ Two things about serving the result, both silent failure modes if got wrong:
   so the served default is `0.4`, below GLiNER's own 0.5. `make ner-eval` runs the
   sweep that derives it; re-run it whenever the NER model changes.
 
-Changing the NER model changes the reranker's training distribution: its text
-features are mined from *live* NER output (see below), so re-run
+Changing the NER model changes the reranker's training distribution: its
+`query_text` is mined from *live* NER output (see below), so re-run
 `make rerank-data && make rerank-train && make rerank-eval` after swapping the
 checkpoint.
 
 ### Reranker
 
-`src/rerank/` turns the synthetic query dataset into a trained CatBoost ranker
-that reorders BM25's candidates. It's a two-stage pipeline, gated by a golden-set
-comparison:
+`src/rerank/` turns the synthetic query dataset into a fine-tuned cross-encoder
+(`cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` by default) that reorders BM25's
+candidates. It's a two-stage pipeline, gated by a golden-set comparison:
 
 1. **`dataset.py`** (`make rerank-data`) replays every query in
    `data/query_dataset.parquet` through the pipeline with `use_rerank=false`, so
@@ -224,31 +224,30 @@ comparison:
    process by default (`src/search/batch.py`) — the same `SearchEngine.search`
    the endpoint calls, which makes it impossible to mine against a server left
    running on older code. For each query the gold geonameid(s) are labelled positive and
-   every other retrieved candidate negative. Each candidate is featurised by the
-   shared `src/rerank/features.py::build_row` — the *same* builder the online
-   reranker uses, so train- and serve-time features are identical by construction.
-   The features are the NER `entities` and the candidate `document` text (both
-   handed to CatBoost as text features) plus `log_population` (the dominant
-   tiebreak signal, log-scaled), `retriever_score`, and `retriever_rank`. The
-   `entities` — not the raw query — are used because that is exactly what the
-   engine feeds the reranker online; the `document` is `build_descriptions()`
-   (sorted name spellings + country + admin1 region). To change the feature set,
-   edit `src/rerank/features.py`. The result is split **by query** — the ranking
-   group — into `data/rerank_train.parquet` / `data/rerank_test.parquet`, so a
-   query (and its gold) never leaks across the split. Splitting by geonameid
-   instead would tear a query's candidates across both sets, leaking the query and
-   leaving truncated (or positive-less) test groups.
+   every other retrieved candidate negative. Every retrieved candidate becomes a
+   row: `query_text` (`" ".join(entities)` — the same string BM25 retrieval
+   scores against, not the raw query text or the typed entity-bucket split, which
+   is display-only) and `document` (`build_descriptions()`: sorted name
+   spellings + country + admin1 region). No hand-engineered features — a
+   cross-encoder attends jointly over both texts in one forward pass, unlike the
+   CatBoost model this project used before, whose independent bag-of-words text
+   columns needed hand-computed overlap features to see the intersection between
+   a query span and the document at all. The result is split **by query** — the
+   ranking group — into `data/rerank_train.parquet` / `data/rerank_test.parquet`,
+   so a query (and its gold) never leaks across the split. Splitting by
+   geonameid instead would tear a query's candidates across both sets, leaking
+   the query and leaving truncated (or positive-less) test groups.
 
-   **Entity source (`RERANK__USE_GOLD_ENTITIES`, default `false`).** By default the
-   text features are the live API's `entity_buckets` — the NER spans, which is what
-   keeps train/serve parity. Set it to `true` and the mining reads the dataset's
-   `gold_*_entities` columns instead, answering "how good would the reranker be if
-   NER were perfect?". That breaks parity deliberately, so the resulting model must
-   not be served; and it only replaces the *text features* — candidates still come
-   from retrieval driven by the NER spans, and queries NER missed entirely retrieve
-   nothing and are skipped, so gold entities cannot recover NER's lost recall. The
-   run's mode is only visible in the log (a WARNING in gold mode), so override the
-   output paths to keep both datasets:
+   **Entity source (`RERANK__USE_GOLD_ENTITIES`, default `false`).** By default
+   `query_text` is joined from the live API's `entities` — the NER spans, which
+   is what keeps train/serve parity. Set it to `true` and the mining joins the
+   dataset's `gold_*_entities` columns instead, answering "how good would the
+   reranker be if NER were perfect?". That breaks parity deliberately, so the
+   resulting model must not be served; and it only replaces `query_text` —
+   candidates still come from retrieval driven by the NER spans, and queries NER
+   missed entirely retrieve nothing and are skipped, so gold entities cannot
+   recover NER's lost recall. The run's mode is only visible in the log (a
+   WARNING in gold mode), so override the output paths to keep both datasets:
 
    ```bash
    RERANK__USE_GOLD_ENTITIES=true \
@@ -256,13 +255,19 @@ comparison:
    RERANK__TEST_PATH=data/rerank_test_gold.parquet \
      make rerank-data
    ```
-2. **`train.py`** (`make rerank-train`) fits a CatBoost `YetiRank` listwise ranker
-   over those features, grouped per query, with early stopping on
-   NDCG@`RERANK__NDCG_TOP` over the held-out queries. The trained model is saved
-   to `data/rerank_model.cbm`.
+2. **`train.py`** (`make rerank-train`) fine-tunes the cross-encoder pointwise
+   with `BinaryCrossEntropyLoss` on those `(query_text, document, label)` pairs.
+   `top_k=50` retrieval mines roughly one positive per query against up to 50
+   negatives, so the loss is given a `pos_weight` computed from the train
+   split's own class ratio. Model selection is by **P@1 on the held-out test
+   split, grouped by query** — scored after every epoch and saved whenever it
+   improves, not by the pointwise `eval_loss` — the same principle
+   `src/ner/train.py`'s span-F1 selection uses. The checkpoint (a directory, not
+   a single file) is saved to `data/rerank_model/`.
 
 `src/rerank/model.py::Reranker` is the inference-side wrapper `SearchEngine`
-loads at startup; it featurises candidates with the same `build_row`.
+loads at startup; it scores each candidate's `document` against the same
+`query_text` the engine already built for BM25 retrieval.
 
 ```bash
 make rerank        # rerank-data -> rerank-train
@@ -355,7 +360,7 @@ was built (`ner_meta.json`, the metrics JSONs).
 | Repo | Contents |
 |---|---|
 | [`mki0809/geosearch-index`](https://huggingface.co/datasets/mki0809/geosearch-index) | serving artifacts: BM25 index, places table, candidate descriptions, manifest |
-| [`mki0809/geosearch-reranker`](https://huggingface.co/mki0809/geosearch-reranker) | the CatBoost model + its metrics |
+| [`mki0809/geosearch-reranker`](https://huggingface.co/mki0809/geosearch-reranker) | the fine-tuned cross-encoder checkpoint + its metrics |
 | [`mki0809/geosearch-ner`](https://huggingface.co/mki0809/geosearch-ner) | the fine-tuned GLiNER checkpoint |
 | [`mki0809/geosearch-queries`](https://huggingface.co/datasets/mki0809/geosearch-queries) | synthetic queries, rerank train/test, golden set, NER export |
 
@@ -404,7 +409,7 @@ Steps 1-3 are enough to run the notebooks; 4-6 rebuild the models themselves.
 ```bash
 ls data/artifacts/          # bm25_index.npz places.parquet descriptions.parquet manifest.json
 ls data/gliner-geosearch/   # the NER weights (~1.1 GB, git-ignored)
-ls data/rerank_model.cbm data/golden_set.parquet data/query_dataset.parquet
+ls data/rerank_model/ data/golden_set.parquet data/query_dataset.parquet
 cat data/artifacts/manifest.json | head -20    # which build is on disk
 ```
 
@@ -520,7 +525,8 @@ make rerank-eval
 Check `RERANK__USE_GOLD_ENTITIES` is `false` before training anything you intend
 to serve. `true` is an ablation that trains on the dataset's gold spans while
 serving gets GLiNER's — a model trained that way is not servable, and nothing in
-the `.cbm` records which it is.
+the checkpoint's weights records which it is (only `rerank_meta.json` does,
+which is why `make hub-push-rerank` refuses to publish a gold-trained model).
 
 ### 6. Publish
 
@@ -597,7 +603,7 @@ reranker training feature.
 | `make hub-pull-all` | ...plus the training and evaluation corpora |
 | `make hub-push-index` | Publish the serving artifacts (needs a write `HF_TOKEN`) |
 | `make hub-push-ner` | Publish the fine-tuned NER model |
-| `make hub-push-rerank` | Publish the CatBoost reranker |
+| `make hub-push-rerank` | Publish the fine-tuned cross-encoder reranker |
 | `make hub-push-data` | Publish the query dataset and derived training sets |
 | `make hub-push-space` | Deploy the Gradio Space |
 
@@ -621,8 +627,8 @@ reranker training feature.
 
 | Target | Description |
 |--------|-------------|
-| `make rerank-data` | Mine labelled `(query, document, label)` pairs by replaying the query dataset through the pipeline (in process; `RERANK__SEARCH_URL` replays against a live server instead) |
-| `make rerank-train` | Fit the CatBoost `YetiRank` reranker on the mined pairs → `data/rerank_model.cbm` |
+| `make rerank-data` | Mine labelled `(query_text, document, label)` pairs by replaying the query dataset through the pipeline (in process; `RERANK__SEARCH_URL` replays against a live server instead) |
+| `make rerank-train` | Fine-tune the cross-encoder on the mined pairs, saving the best-P@1 epoch → `data/rerank_model/` |
 | `make rerank-eval` | Golden-set metrics: rerank vs retriever baseline vs ideal ceiling → `data/rerank_metrics.json` |
 | `make rerank` | Full pipeline: `rerank-data` → `rerank-train` |
 
@@ -680,9 +686,9 @@ geosearch/
     │   ├── train.py            # fine-tune GLiNER, select the best epoch by val span F1
     │   └── evaluate.py         # span P/R/F1 vs baseline + decision-threshold sweep
     ├── rerank/
-    │   ├── features.py         # shared feature builder (train/serve parity)
-    │   ├── dataset.py          # mine labelled feature rows from the live API
-    │   ├── train.py            # fit the CatBoost YetiRank ranker, NDCG@k eval
+    │   ├── features.py         # entity bucketing shared with the search engine
+    │   ├── dataset.py          # mine labelled (query_text, document, label) rows from the live API
+    │   ├── train.py            # fine-tune the cross-encoder, P@1-based epoch selection
     │   ├── evaluate.py         # golden-set: rerank vs baseline vs ideal
     │   └── model.py            # Reranker: inference-side scoring wrapper
     └── api/
@@ -748,14 +754,16 @@ All settings live in `src/config.py` and are overridable via `.env`:
 | `RERANK__SEARCH_URL` | _(empty)_ | Empty replays queries **in process**; set a URL to replay against a running server instead |
 | `RERANK__TEST_SIZE` | `0.2` | Fraction of distinct queries held out for test (split by query — the ranking group — never by geonameid) |
 | `RERANK__GOLDEN_SET_PATH` | `data/golden_set.parquet` | Curated `(query, gold geonameIds)` set for `make rerank-eval` (never used for training) |
-| `RERANK__MODEL_PATH` | `data/rerank_model.cbm` | Where the trained reranker is saved/loaded from |
-| `RERANK__NDCG_TOP` | `10` | `k` for the NDCG@k early-stopping/eval metric |
+| `RERANK__MODEL_PATH` | `data/rerank_model` | Directory the trained cross-encoder checkpoint is saved/loaded from |
+| `RERANK__BASE_MODEL` | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Zero-shot checkpoint to fine-tune from |
+| `RERANK__EPOCHS` | `4` | Fine-tuning epochs (`--epochs` overrides per run) |
+| `RERANK__LEARNING_RATE` | `2e-5` | Fine-tuning learning rate |
 
 > Other dataset tunables (`DATASET__N_TOP`, `DATASET__N_MID`, `DATASET__N_LOW`, `DATASET__STYLE_WEIGHTS`,
 > `DATASET__TOPICS`, `DATASET__TEMPERATURE`, `DATASET__REASONING_EFFORT`,
 > `DATASET__MAX_RETRIES`, `DATASET__CHECKPOINT_PATH`, …) live in `DatasetConfig`, and other reranker
-> tunables (`RERANK__TOP_K`, `RERANK__ITERATIONS`, `RERANK__LEARNING_RATE`, `RERANK__L2_LEAF_REG`,
-> `RERANK__EARLY_STOPPING_ROUNDS`, …) live in `RerankConfig`, both in `src/config.py`.
+> tunables (`RERANK__TOP_K`, `RERANK__BATCH_SIZE`, `RERANK__WARMUP_RATIO`, `RERANK__WEIGHT_DECAY`,
+> `RERANK__MAX_LENGTH`, `RERANK__POS_WEIGHT`, …) live in `RerankConfig`, both in `src/config.py`.
 
 ### Adding a new country
 

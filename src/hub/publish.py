@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -94,32 +93,22 @@ def push_ner_model(cfg: NerConfig, settings: Settings, *, repo_id: str) -> str:
 
 
 def push_reranker(settings: Settings, *, repo_id: str) -> str:
-    """Upload the CatBoost model, its metrics, and a card naming its features."""
+    """Upload the fine-tuned cross-encoder checkpoint directory and its card.
+
+    Uploads the **directory** `make rerank-train` wrote — config.json, weights,
+    tokenizer files, `rerank_meta.json` — the same shape `push_ner_model` uses,
+    since a sentence-transformers checkpoint is a directory, not a single file.
+    """
     require_token(settings)
     cfg = settings.rerank
-    model_path = Path(cfg.model_path)
-    if not model_path.exists():
+    model_dir = Path(cfg.model_path)
+    if not model_dir.is_dir():
         raise FileNotFoundError(
-            f"{model_path} does not exist — run `make rerank-train` first."
-        )
-
-    metrics = cards._read_json(cfg.metrics_path)
-    if metrics is None:
-        logger.warning(
-            "%s is absent — the card will say 'not measured'. Run `make rerank-eval`.",
-            cfg.metrics_path,
+            f"{model_dir} does not exist — run `make rerank-train` first."
         )
     # The one fact about this model that must not be lost: a model trained on
-    # gold entities is not servable, and nothing in the .cbm records which it is.
-    meta = {
-        "use_gold_entities": cfg.use_gold_entities,
-        "iterations": cfg.iterations,
-        "learning_rate": cfg.learning_rate,
-        "ndcg_top": cfg.ndcg_top,
-        "trained_at": datetime.fromtimestamp(model_path.stat().st_mtime, UTC).isoformat(
-            timespec="seconds"
-        ),
-    }
+    # gold entities is not servable, and nothing in the checkpoint itself
+    # records which it is. Checked before any Hub I/O, so a bad flag fails fast.
     if cfg.use_gold_entities:
         raise SystemExit(
             "RERANK__USE_GOLD_ENTITIES is true, so the trained model is the "
@@ -127,21 +116,38 @@ def push_reranker(settings: Settings, *, repo_id: str) -> str:
             "must not be published as servable. Re-train with it false."
         )
 
+    meta_path = model_dir / "rerank_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"{meta_path} is missing — re-run `make rerank-train` (it writes "
+            "this alongside the weights)."
+        )
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+    metrics = cards._read_json(cfg.metrics_path)
+    if metrics is None:
+        logger.warning(
+            "%s is absent — the card will say 'not measured'. Run `make rerank-eval`.",
+            cfg.metrics_path,
+        )
+
     ensure_repo(repo_id, "model", private=settings.hf.private, settings=settings)
-    with TemporaryDirectory() as tmp:
-        staging = Path(tmp)
-        files = {model_path.name: model_path}
-        meta_path = staging / "rerank_meta.json"
-        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        files["rerank_meta.json"] = meta_path
-        files["README.md"] = _write_card(
-            cards.render_reranker_card(meta, metrics, settings), staging
+    _write_card(cards.render_reranker_card(meta, metrics, settings), model_dir)
+    if metrics is not None:
+        (model_dir / "rerank_metrics.json").write_text(
+            json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        if metrics is not None:
-            files["rerank_metrics.json"] = Path(cfg.metrics_path)
-        return push_files(
-            files, repo_id, "model", message="Publish reranker", settings=settings
-        )
+
+    return push_folder(
+        model_dir,
+        repo_id,
+        "model",
+        message=(
+            f"Fine-tuned {meta.get('base_model')} — epoch {meta.get('best_epoch')}, "
+            f"P@1 {meta.get('best_p_at_1')}"
+        ),
+        settings=settings,
+    )
 
 
 # ---------------------------------------------------------------------------

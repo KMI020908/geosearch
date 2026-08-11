@@ -9,11 +9,12 @@ The pipeline mirrors the notebook prototype, cleaned up:
    later *served* with.
 2. Replay every generated query through the live search API
    (:func:`search_batch`) to mine retrieval candidates.
-3. Featurise every retrieved candidate (:func:`build_pairs` via
-   :mod:`src.rerank.features`), labelling gold geonameid(s) positive and every
-   other retrieved candidate negative. The text features are the query's entity
-   buckets — by default the NER spans the API returns, or the dataset's gold
-   spans when ``RERANK__USE_GOLD_ENTITIES=true`` (see :func:`_entity_buckets`).
+3. Turn every retrieved candidate into a labelled pair (:func:`build_pairs`),
+   labelling gold geonameid(s) positive and every other retrieved candidate
+   negative. ``query_text`` is by default the NER spans the API returns
+   (``" ".join(entities)`` — the same string BM25 retrieval scores against), or
+   the dataset's gold spans when ``RERANK__USE_GOLD_ENTITIES=true`` (see
+   :func:`_query_text`).
 4. Split by query — the ranking group — so no query (and its gold) leaks
    across train/test (:func:`split`) and write both Parquets.
 
@@ -32,21 +33,16 @@ import polars as pl
 from country_list import countries_for_language
 
 from src.config import RerankConfig, settings
-from src.rerank.features import (
-    FEATURE_COLUMNS,
-    GOLD_BUCKET_COLS,
-    NAME_SEPARATOR,
-    build_row,
-)
+from src.rerank.features import GOLD_BUCKET_COLS, NAME_SEPARATOR
 from src.search.artifacts import read_descriptions
 from src.search.batch import search_batch
 
 logger = logging.getLogger(__name__)
 
-# One mined row: the shared feature columns, the raw ``query`` (kept only as the
-# ranking group id at train time and the split key — never fed to the model),
-# and the ``label`` target.
-OUTPUT_COLS = [*FEATURE_COLUMNS, "query", "label"]
+# One mined row: the (query_text, document) pair the cross-encoder scores, the
+# raw ``query`` (kept only as the ranking group id at train time and the split
+# key — never fed to the model), and the ``label`` target.
+OUTPUT_COLS = ["query_text", "document", "query", "label"]
 
 
 def build_descriptions(
@@ -88,13 +84,14 @@ def build_descriptions(
     return descriptions
 
 
-def _entity_buckets(res: dict, qrow: dict, use_gold: bool) -> dict[str, str]:
-    """The query's typed entity strings: gold dataset spans or live NER spans.
+def _query_text(res: dict, qrow: dict, use_gold: bool) -> str:
+    """The query's text side: gold dataset spans or live NER spans, joined flat.
 
-    ``use_gold=False`` (default) reads ``entity_buckets`` off the API response —
-    the GLiNER spans the engine itself feeds the reranker, which is what keeps
-    train/serve features identical. ``use_gold=True`` reads the dataset's
-    reference spans instead (:data:`~src.rerank.features.GOLD_BUCKET_COLS`),
+    ``use_gold=False`` (default) joins ``entities`` off the API response — the
+    exact ``" ".join(entities)`` string the engine feeds both BM25 retrieval and
+    the reranker, which is what keeps train/serve features identical.
+    ``use_gold=True`` joins the dataset's reference spans instead
+    (:data:`~src.rerank.features.GOLD_BUCKET_COLS`, city/country/admin1 order),
     which the generator wrote with the very same ``bucket_entities``, so the two
     sources are drop-in comparable.
     """
@@ -106,19 +103,19 @@ def _entity_buckets(res: dict, qrow: dict, use_gold: bool) -> dict[str, str]:
                 "column(s) — it predates the gold entity buckets. Regenerate it "
                 "(make dataset) or unset RERANK__USE_GOLD_ENTITIES."
             )
-        # ``or ""``: build_row needs a str, and a Parquet column may hold nulls.
-        return {name: qrow[col] or "" for name, col in GOLD_BUCKET_COLS.items()}
+        parts = [qrow[col] or "" for col in GOLD_BUCKET_COLS.values()]
+        return " ".join(p for p in parts if p)
 
-    # A missing bucket means the API is on an older build that predates the
-    # typed-entity split — replaying against it would silently mislabel the
-    # features. Fail loudly with a fix instead of a bare KeyError.
-    if "entity_buckets" not in res:
+    # A missing field means the API is on an older build that predates it —
+    # replaying against it would silently mislabel the pairs. Fail loudly with a
+    # fix instead of a bare KeyError.
+    if "entities" not in res:
         raise RuntimeError(
-            "Search API response has no 'entity_buckets' field — the server "
-            "is running an outdated build. Restart it on the current code "
+            "Search API response has no 'entities' field — the server is "
+            "running an outdated build. Restart it on the current code "
             "(uv run uvicorn src.api.main:app) before running rerank-data."
         )
-    return res["entity_buckets"]
+    return " ".join(res["entities"])
 
 
 def build_pairs(
@@ -128,24 +125,20 @@ def build_pairs(
     *,
     use_gold_entities: bool = False,
 ) -> pl.DataFrame:
-    """Turn search results into labelled feature rows, one per candidate.
+    """Turn search results into labelled ``(query_text, document, label)`` rows.
 
-    Every retrieved candidate is featurised via :func:`src.rerank.features.build_row`
-    — the same builder the online :class:`~src.rerank.model.Reranker` uses, so
-    train- and serve-time features are identical by construction. The text
-    features are the query's entity spans split by type, not the raw query:
-    ``entity_buckets`` from the API response (the NER spans the engine actually
-    feeds the reranker) by default, or the dataset's gold spans when
-    ``use_gold_entities`` is set (:func:`_entity_buckets`). A candidate is
-    labelled 1 if it is one of the query's gold geonameids, else 0, and
-    ``retriever_rank`` is its 0-based position in the retrieved list.
+    ``query_text`` is the raw text side the online cross-encoder
+    :class:`~src.rerank.model.Reranker` scores against: by default the same
+    ``" ".join(entities)`` string BM25 retrieval used, or the dataset's gold
+    spans when ``use_gold_entities`` is set (:func:`_query_text`). A candidate is
+    labelled 1 if it is one of the query's gold geonameids, else 0.
 
     ``use_gold_entities`` is an ablation — "how would the reranker do if NER were
-    perfect?" — and only replaces the *text features*. The candidate set still
-    comes from retrieval driven by the NER spans (the API takes text, not spans),
-    and queries where NER found nothing retrieve nothing and are skipped below.
-    So it does not recover recall lost to NER misses, and the resulting model is
-    not servable: online the reranker always sees NER spans.
+    perfect?" — and only replaces ``query_text``. The candidate set still comes
+    from retrieval driven by the NER spans (the API takes text, not spans), and
+    queries where NER found nothing retrieve nothing and are skipped below. So it
+    does not recover recall lost to NER misses, and the resulting model is not
+    servable: online the reranker always sees NER spans.
 
     Every retrieved candidate becomes a row (no negative subsampling). Queries
     where NER found no entity are skipped (nothing to rank), as are candidates
@@ -153,7 +146,7 @@ def build_pairs(
     positive — the reranker only ever ranks retrieved candidates anyway).
     """
     # Responses line up with dataset rows positionally (see :func:`search_batch`),
-    # and that alignment carries the labels — plus the features themselves under
+    # and that alignment carries the labels — plus ``query_text`` itself under
     # ``use_gold_entities``. A length mismatch would silently pair the wrong rows.
     if len(results) != query_dataset.height:
         raise ValueError(
@@ -166,24 +159,24 @@ def build_pairs(
         if not res["entities"]:
             continue
         pos_gids = set(qrow["geonameid"])
-        entity_buckets = _entity_buckets(res, qrow, use_gold_entities)
-        for rank, candidate in enumerate(res["results"]):
+        query_text = _query_text(res, qrow, use_gold_entities)
+        for candidate in res["results"]:
             gid = candidate["geonameid"]
             if gid not in descriptions:
                 continue
-            row = build_row(
-                **entity_buckets,
-                document=descriptions[gid],
-                population=candidate["population"],
-                retriever_score=candidate["retriever_score"],
-                retriever_rank=rank,
+            rows.append(
+                {
+                    "query_text": query_text,
+                    "document": descriptions[gid],
+                    "query": res["query"],
+                    "label": 1 if gid in pos_gids else 0,
+                }
             )
-            row["query"] = res["query"]
-            row["label"] = 1 if gid in pos_gids else 0
-            rows.append(row)
 
     if not rows:
-        return pl.DataFrame(schema={c: pl.Float64 for c in OUTPUT_COLS})
+        return pl.DataFrame(
+            schema=dict.fromkeys(OUTPUT_COLS, pl.Utf8) | {"label": pl.Int64}
+        )
     return pl.DataFrame(rows).select(OUTPUT_COLS)
 
 
@@ -228,7 +221,7 @@ def main() -> None:
             cfg.query_dataset_path,
         )
     else:
-        logger.info("Entity source: NER spans (entity_buckets from the API)")
+        logger.info("Entity source: NER spans (entities from the API)")
 
     logger.info("Searching %d queries via %s…", query_dataset.height, cfg.search_url)
     results = search_batch(query_dataset["query"].to_list(), cfg)
